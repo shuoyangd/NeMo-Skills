@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import sys
 from pathlib import Path
-from typing import List
 
 import hydra
 from omegaconf import DictConfig
@@ -27,55 +25,14 @@ from nemo_skills.inference.generate import GenerateSolutionsConfig, GenerationTa
 from nemo_skills.utils import get_help_message, setup_logging
 
 
-class ForcePrefixLogitsProcessor:
-    """
-    This processor forces the generation to start with a specific prefix.
-    """
-
-    def __init__(self, prefix_str: str, tokenizer):
-        # Import vLLM LogitsProcessor at runtime (when actually needed)
-        from vllm.logits_processor import LogitsProcessor
-
-        # Make this class inherit from LogitsProcessor at runtime
-        self.__class__.__bases__ = (LogitsProcessor,)
-        super().__init__()
-        # Tokenize the prefix and store the token IDs
-        self.prefix_token_ids = tokenizer.encode(prefix_str, add_special_tokens=False)
-        self.prefix_len = len(self.prefix_token_ids)
-
-    def __call__(self, token_ids: List[int], logits):
-        import torch
-
-        current_len = len(token_ids)
-
-        # Check if the generation is still within the prefix length
-        if current_len < self.prefix_len:
-            # Get the next required token ID from our prefix
-            next_token_id = self.prefix_token_ids[current_len]
-
-            # Create a mask to suppress all tokens except the one we want
-            # We set all logits to a very low number (-inf)
-            mask = torch.full_like(logits, -float("inf"))
-
-            # Set the logit for our desired next token to 0.0, making it
-            # the only possible choice after softmax.
-            mask[next_token_id] = 0.0
-
-            # Apply the mask
-            return logits + mask
-
-        # If we are past the prefix, do nothing and return original logits
-        return logits
-
-
 @nested_dataclass(kw_only=True)
 class ReasoningWithForcedLangConfig(GenerateSolutionsConfig):
     """Configuration for reasoning with forced language generation task."""
 
-    # Language and prefix parameters
-    language_code: str = "en"  # Language code to use from lang_libs.py
-    enable_forced_prefix: bool = True  # Whether to enable forced prefix generation
-    forced_prefix: str | None = None  # Override prefix (if None, will load from lang_libs.py)
+    # Add any custom parameters specific to your task here
+    # Example:
+    # forced_language: str = "French"  # Language to force the model to use
+    # reasoning_type: str = "step_by_step"  # Type of reasoning to apply
 
     def _get_disallowed_params(self):
         """Override to specify parameters that should not be changed from defaults."""
@@ -106,79 +63,44 @@ class ReasoningWithForcedLangTask(GenerationTask):
     def __init__(self, cfg: ReasoningWithForcedLangConfig):
         """Initialize the reasoning with forced language task."""
         super().__init__(cfg)
+        # Add any custom initialization here
 
-        # Load language configuration from lang_libs.py
-        self.lang_config = self._load_language_config(cfg.language_code)
+    def preprocess_data(self, data):
+        """
+        Preprocess data before generation.
 
-        # Determine the prefix to use
-        if cfg.forced_prefix is not None:
-            # Use explicitly provided prefix
-            prefix_to_use = cfg.forced_prefix
-        else:
-            # Load from lang_libs.py
-            prefix_to_use = f"<think> {self.lang_config['reasoning_prefix']}"
+        Args:
+            data: List of data points to process
 
-        # Initialize the forced prefix logits processor if enabled
-        if cfg.enable_forced_prefix and self.tokenizer:
-            from transformers import AutoTokenizer
+        Returns:
+            Preprocessed data
+        """
+        # Add custom preprocessing logic here
+        # Example: modify prompts to include language forcing instructions
 
-            # Get the actual tokenizer object if we only have the name/path
-            if isinstance(self.tokenizer, str):
-                tokenizer_obj = AutoTokenizer.from_pretrained(self.tokenizer)
-            else:
-                tokenizer_obj = self.tokenizer
-            self.force_prefix_processor = ForcePrefixLogitsProcessor(prefix_to_use, tokenizer_obj)
-            self.actual_prefix = prefix_to_use
-        else:
-            self.force_prefix_processor = None
-            self.actual_prefix = None
+        # Call parent method first if needed
+        data = super().preprocess_data(data)
 
-    def _load_language_config(self, language_code: str) -> dict:
-        """Load language configuration from lang_libs.py"""
-        lang_libs_path = Path(__file__).parent / "lang_libs.py"
+        # Your custom preprocessing logic here
+        # for data_point in data:
+        #     # Modify data_point as needed
+        #     pass
 
-        # Read the file as text and extract the JSON
-        with open(lang_libs_path, "r", encoding="utf-8") as f:
-            content = f.read()
-
-        # Extract the dictionary from the file (it's a Python dict, not JSON)
-        # We'll use eval here since it's a controlled environment
-        lang_configs = eval(content)
-
-        if language_code not in lang_configs:
-            raise ValueError(
-                f"Language code '{language_code}' not found in lang_libs.py. Available: {list(lang_configs.keys())}"
-            )
-
-        return lang_configs[language_code]
+        return data
 
     def postprocess(self):
         """
         Postprocess data after generation.
         Data is already saved to self.cfg.output_file.
         """
+        # Add custom postprocessing logic here
+        # Example: analyze language usage, filter results, etc.
+
         # Call parent method first if needed
         super().postprocess()
 
-        if self.cfg.enable_forced_prefix:
-            with open(self.cfg.output_file, "r", encoding="utf-8") as f:
-                results = [json.loads(line) for line in f]
-
-            # Analyze how many generations successfully used the forced prefix
-            prefix_usage_count = 0
-            for result in results:
-                if result.get("generation", "").startswith(self.actual_prefix):
-                    prefix_usage_count += 1
-
-            success_rate = prefix_usage_count / len(results) if results else 0
-            print(f"Forced prefix usage: {prefix_usage_count}/{len(results)} ({success_rate:.2%})")
-            print(f"Language: {self.cfg.language_code}")
-            print(f"Forced prefix: {repr(self.actual_prefix)}")
-
-            # You can add more analysis here:
-            # - Language detection in the reasoning traces
-            # - Quality metrics for reasoning
-            # - Export statistics to a separate file
+        # Your custom postprocessing logic here
+        pass
 
     def prefill_generation(self, data_point) -> dict | None:
         """
@@ -199,6 +121,31 @@ class ReasoningWithForcedLangTask(GenerationTask):
 
         return super().prefill_generation(data_point)
 
+    def fill_prompt(self, data_point, data):
+        """
+        Fill the prompt for a given data point.
+
+        Args:
+            data_point: Single data point to fill prompt for
+            data: Full dataset (in case context is needed)
+
+        Returns:
+            Filled prompt (string or list of messages)
+        """
+        # Get the base prompt first
+        filled_prompt = super().fill_prompt(data_point, data)
+
+        # Add custom prompt modifications here
+        # Example: add language forcing instructions
+        # if isinstance(filled_prompt, list):
+        #     # OpenAI format (list of messages)
+        #     filled_prompt[-1]["content"] += f"\n\nPlease respond in {self.cfg.forced_language}."
+        # else:
+        #     # String format
+        #     filled_prompt += f"\n\nPlease respond in {self.cfg.forced_language}."
+
+        return filled_prompt
+
     async def process_single_datapoint(self, data_point, all_data):
         """
         Process a single data point to generate output.
@@ -210,46 +157,22 @@ class ReasoningWithForcedLangTask(GenerationTask):
         Returns:
             Generated output dict
         """
-        # Handle inference config - check if it's a dataclass or already a dict
-        from dataclasses import asdict, is_dataclass
+        # You can either call the parent method or implement completely custom logic
 
-        if is_dataclass(self.cfg.inference):
-            inference_params = asdict(self.cfg.inference)
-        else:
-            # Already a dict from Hydra
-            inference_params = dict(self.cfg.inference)
+        # Option 1: Use parent method with potential modifications
+        output = await super().process_single_datapoint(data_point, all_data)
 
-        generation_params = {
-            **inference_params,
-            **self.extra_generate_params,
-            "prompt": self.fill_prompt(data_point, all_data),
-            "stop_phrases": [self.cfg.stop_phrase] if self.cfg.stop_phrase else None,
-        }
-
-        # Add forced prefix logits processor if enabled
-        if self.force_prefix_processor is not None:
-            # Add logits processors to the generation parameters
-            logits_processors = generation_params.get("logits_processors", [])
-            logits_processors.append(self.force_prefix_processor)
-            generation_params["logits_processors"] = logits_processors
-
-        if self.cfg.code_execution:
-            if self.cfg.override_max_code_executions and self.cfg.total_code_executions_in_prompt is not None:
-                generation_params["max_code_executions"] = data_point["total_code_executions"]
-
-        output = await self.llm.generate_async(**generation_params)
-
-        # Add the forced prefix to the output if it was used
-        if self.force_prefix_processor is not None and self.cfg.enable_forced_prefix:
-            # The forced prefix should already be in the generation, but we can add it explicitly
-            # to make it clear in the output (this depends on how your model interface works)
-            if "generation" in output and not output["generation"].startswith(self.actual_prefix):
-                output["generation"] = self.actual_prefix + output["generation"]
+        # Add any post-generation processing here
+        # Example: validate that output is in the correct language
 
         return output
 
+        # Option 2: Implement completely custom generation logic
+        # return await self.llm.generate_async(
+        #     prompt=self.fill_prompt(data_point, all_data),
+        #     **your_custom_params
+        # )
 
-GENERATION_TASK_CLASS = ReasoningWithForcedLangTask
 
 # Register the custom config
 cs = hydra.core.config_store.ConfigStore.instance()
