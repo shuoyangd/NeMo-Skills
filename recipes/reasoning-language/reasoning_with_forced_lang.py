@@ -31,15 +31,12 @@ The implementation works by modifying the prompt to include the forced prefix
 as the beginning of the assistant's response, then continuing generation from there.
 """
 
-import json
+import importlib.util
 import sys
 from pathlib import Path
 
 import hydra
 from omegaconf import DictConfig
-
-# Add parent directory to sys.path to import nemo_skills
-sys.path.append(str(Path(__file__).parent.parent.parent))
 
 from nemo_skills.inference.generate import GenerateSolutionsConfig, GenerationTask, nested_dataclass
 from nemo_skills.utils import get_help_message, setup_logging
@@ -47,21 +44,29 @@ from nemo_skills.utils import get_help_message, setup_logging
 
 def load_lang_libs():
     """Load language libraries from lang_libs.py file."""
+
     lang_libs_path = Path(__file__).parent / "lang_libs.py"
 
     if not lang_libs_path.exists():
         raise FileNotFoundError(f"lang_libs.py not found at {lang_libs_path}")
 
-    # Read the file content and parse as JSON (since it's a JSON-like dict)
-    with open(lang_libs_path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    # Parse the content as JSON
     try:
-        lang_libs = json.loads(content)
-        return lang_libs
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse lang_libs.py as JSON: {e}")
+        # Import the module dynamically
+        spec = importlib.util.spec_from_file_location("lang_libs", lang_libs_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("Failed to create module spec")
+
+        lang_libs_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lang_libs_module)
+
+        # Extract the LANG_LIBS variable from the module
+        if not hasattr(lang_libs_module, "LANG_LIBS"):
+            raise RuntimeError("LANG_LIBS not found in lang_libs.py")
+
+        return lang_libs_module.LANG_LIBS
+
+    except Exception as e:
+        raise ValueError(f"Failed to load lang_libs.py: {e}")
 
 
 @nested_dataclass(kw_only=True)
@@ -75,7 +80,7 @@ class ReasoningWithForcedLangConfig(GenerateSolutionsConfig):
     - Ensuring consistent output formatting
     """
 
-    language: str = ""  # Language code to use for forced prefix and system message
+    forced_reason_language: str = ""  # Language code to use for forced prefix and system message
     """
     Language code to automatically load system prompt and reasoning prefix from lang_libs.py.
 
@@ -89,17 +94,17 @@ class ReasoningWithForcedLangConfig(GenerateSolutionsConfig):
     - "zh": Chinese
 
     When specified, this will automatically set:
-    - forced_system_message from lang_libs[language]["system_prompt"]
-    - forced_prefix from lang_libs[language]["reasoning_prefix"]
+    - forced_system_message from lang_libs[forced_reason_language]["system_prompt"]
+    - forced_prefix from lang_libs[forced_reason_language]["reasoning_prefix"]
 
     If you want to override these individually, you can still use the manual parameters below.
     """
 
-    forced_prefix: str = ""  # Manual override for prefix (optional if language is set)
+    forced_prefix: str = ""  # Manual override for prefix (optional if forced_reason_language is set)
     """
     String to force at the beginning of the model's response.
 
-    If 'language' parameter is set, this will be automatically loaded from lang_libs.py.
+    If 'forced_reason_language' parameter is set, this will be automatically loaded from lang_libs.py.
     You can still override it manually by setting this parameter.
 
     Examples:
@@ -111,11 +116,11 @@ class ReasoningWithForcedLangConfig(GenerateSolutionsConfig):
     will continue generation from that point.
     """
 
-    forced_system_message: str = ""  # Manual override for system message (optional if language is set)
+    forced_system_message: str = ""  # Manual override for system message (optional if forced_reason_language is set)
     """
     Custom system message to use instead of the default system message.
 
-    If 'language' parameter is set, this will be automatically loaded from lang_libs.py.
+    If 'forced_reason_language' parameter is set, this will be automatically loaded from lang_libs.py.
     You can still override it manually by setting this parameter.
 
     Examples:
@@ -144,11 +149,11 @@ class ReasoningWithForcedLangTask(GenerationTask):
     the model follows a specific reasoning pattern.
 
     Usage example:
-        # Command line usage with language parameter (recommended):
+        # Command line usage with forced_reason_language parameter (recommended):
         python reasoning_with_forced_lang.py \
             input_file=data.jsonl \
             output_file=results.jsonl \
-            language=de \
+            forced_reason_language=de \
             server.model=llama-3.1-70b
 
         # Command line usage with manual parameters:
@@ -163,7 +168,7 @@ class ReasoningWithForcedLangTask(GenerationTask):
         cfg = ReasoningWithForcedLangConfig(
             input_file="data.jsonl",
             output_file="results.jsonl",
-            language="de",  # Automatically loads German prompts
+            forced_reason_language="de",  # Automatically loads German prompts
             server={"model": "llama-3.1-70b"}
         )
         task = ReasoningWithForcedLangTask(cfg)
@@ -192,16 +197,18 @@ class ReasoningWithForcedLangTask(GenerationTask):
         """Initialize the reasoning with forced language task."""
         super().__init__(cfg)
 
-        # Load language settings if language parameter is specified
-        if cfg.language:
+        # Load language settings if forced_reason_language parameter is specified
+        if cfg.forced_reason_language:
             try:
                 lang_libs = load_lang_libs()
-                if cfg.language not in lang_libs:
+                if cfg.forced_reason_language not in lang_libs:
                     available_langs = list(lang_libs.keys())
-                    raise ValueError(f"Language '{cfg.language}' not supported. Available: {available_langs}")
+                    raise ValueError(
+                        f"Language '{cfg.forced_reason_language}' not supported. Available: {available_langs}"
+                    )
 
                 # Set forced_prefix and forced_system_message from lang_libs if not manually overridden
-                lang_config = lang_libs[cfg.language]
+                lang_config = lang_libs[cfg.forced_reason_language]
 
                 if not cfg.forced_prefix:
                     cfg.forced_prefix = lang_config["reasoning_prefix"]
@@ -209,12 +216,12 @@ class ReasoningWithForcedLangTask(GenerationTask):
                 if not cfg.forced_system_message:
                     cfg.forced_system_message = lang_config["system_prompt"]
 
-                print(f"Loaded language settings for '{cfg.language}':")
+                print(f"Loaded language settings for '{cfg.forced_reason_language}':")
                 print(f"  System prompt: {cfg.forced_system_message}")
                 print(f"  Reasoning prefix: {cfg.forced_prefix}")
 
             except Exception as e:
-                raise RuntimeError(f"Failed to load language settings for '{cfg.language}': {e}")
+                raise RuntimeError(f"Failed to load language settings for '{cfg.forced_reason_language}': {e}")
 
     def preprocess_data(self, data):
         """
