@@ -12,6 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+Reasoning with Forced Language Generation Module
+
+This module provides functionality to force language models to start their reasoning
+with a specific prefix string. This is particularly useful for:
+
+1. Multilingual reasoning: Force the model to think in a specific language
+   Example: forced_prefix="<think> Ich muss auf Deutsch denken"
+
+2. Structured reasoning: Ensure consistent reasoning patterns
+   Example: forced_prefix="<reasoning> Let me think step by step:"
+
+3. Output formatting: Control the beginning of the model's response
+   Example: forced_prefix="I need to solve this problem by"
+
+The implementation works by modifying the prompt to include the forced prefix
+as the beginning of the assistant's response, then continuing generation from there.
+"""
+
 import sys
 from pathlib import Path
 
@@ -27,10 +46,29 @@ from nemo_skills.utils import get_help_message, setup_logging
 
 @nested_dataclass(kw_only=True)
 class ReasoningWithForcedLangConfig(GenerateSolutionsConfig):
-    """Configuration for reasoning with forced language generation task."""
+    """Configuration for reasoning with forced language generation task.
 
-    # Add any custom parameters specific to your task here
-    # Example:
+    This configuration allows you to force the model to start its reasoning
+    with a specific prefix string. This is useful for:
+    - Forcing the model to think in a specific language
+    - Starting with specific reasoning patterns
+    - Ensuring consistent output formatting
+    """
+
+    forced_prefix: str = ""  # Prefix to force at the beginning of reasoning chain
+    """
+    String to force at the beginning of the model's response.
+
+    Examples:
+    - "<think> Ich muss auf Deutsch denken" (force German thinking)
+    - "<reasoning> Let me think step by step:" (force structured reasoning)
+    - "I need to solve this problem by" (force specific approach)
+
+    The prefix will be prepended to the assistant's response, and the model
+    will continue generation from that point.
+    """
+
+    # Additional parameters you can add:
     # forced_language: str = "French"  # Language to force the model to use
     # reasoning_type: str = "step_by_step"  # Type of reasoning to apply
 
@@ -40,7 +78,31 @@ class ReasoningWithForcedLangConfig(GenerateSolutionsConfig):
 
 
 class ReasoningWithForcedLangTask(GenerationTask):
-    """Custom generation task for reasoning with forced language."""
+    """Custom generation task for reasoning with forced language.
+
+    This task extends the base GenerationTask to support forcing a specific
+    prefix at the beginning of the model's response. This is particularly
+    useful for multilingual reasoning tasks or when you want to ensure
+    the model follows a specific reasoning pattern.
+
+    Usage example:
+        # Command line usage:
+        python reasoning_with_forced_lang.py \
+            input_file=data.jsonl \
+            output_file=results.jsonl \
+            forced_prefix="<think> Ich muss auf Deutsch denken" \
+            server.model=llama-3.1-70b
+
+        # Programmatic usage:
+        cfg = ReasoningWithForcedLangConfig(
+            input_file="data.jsonl",
+            output_file="results.jsonl",
+            forced_prefix="<think> Let me think step by step:",
+            server={"model": "llama-3.1-70b"}
+        )
+        task = ReasoningWithForcedLangTask(cfg)
+        task.generate()
+    """
 
     @classmethod
     def get_generation_default_args(cls) -> str:
@@ -157,22 +219,51 @@ class ReasoningWithForcedLangTask(GenerationTask):
         Returns:
             Generated output dict
         """
-        # You can either call the parent method or implement completely custom logic
+        # Handle inference config - check if it's a dataclass or already a dict
+        from dataclasses import asdict, is_dataclass
 
-        # Option 1: Use parent method with potential modifications
-        output = await super().process_single_datapoint(data_point, all_data)
+        if is_dataclass(self.cfg.inference):
+            inference_params = asdict(self.cfg.inference)
+        else:
+            # Already a dict from Hydra
+            inference_params = dict(self.cfg.inference)
 
-        # Add any post-generation processing here
-        # Example: validate that output is in the correct language
+        generation_params = {
+            **inference_params,
+            **self.extra_generate_params,
+            "prompt": self.fill_prompt(data_point, all_data),
+            "stop_phrases": [self.cfg.stop_phrase] if self.cfg.stop_phrase else None,
+        }
+
+        # Add forced prefix if specified
+        if self.cfg.forced_prefix:
+            # For forced prefix, we need to modify the prompt to include the prefix
+            # as the beginning of the assistant's response
+            prompt = generation_params["prompt"]
+
+            if isinstance(prompt, list):
+                # OpenAI chat format - add assistant message with the forced prefix
+                prompt.append({"role": "assistant", "content": self.cfg.forced_prefix})
+            else:
+                # String format - append the forced prefix
+                prompt += f"\n\nAssistant: {self.cfg.forced_prefix}"
+
+            generation_params["prompt"] = prompt
+
+        if self.cfg.code_execution:
+            if self.cfg.override_max_code_executions and self.cfg.total_code_executions_in_prompt is not None:
+                generation_params["max_code_executions"] = data_point["total_code_executions"]
+
+        output = await self.llm.generate_async(**generation_params)
+
+        # If we used a forced prefix, we need to prepend it to the generation
+        if self.cfg.forced_prefix and "generation" in output:
+            output["generation"] = self.cfg.forced_prefix + output["generation"]
 
         return output
 
-        # Option 2: Implement completely custom generation logic
-        # return await self.llm.generate_async(
-        #     prompt=self.fill_prompt(data_point, all_data),
-        #     **your_custom_params
-        # )
 
+GENERATION_TASK_CLASS = ReasoningWithForcedLangTask
 
 # Register the custom config
 cs = hydra.core.config_store.ConfigStore.instance()
