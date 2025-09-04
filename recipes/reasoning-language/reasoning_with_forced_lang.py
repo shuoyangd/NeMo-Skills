@@ -31,6 +31,7 @@ The implementation works by modifying the prompt to include the forced prefix
 as the beginning of the assistant's response, then continuing generation from there.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -44,6 +45,25 @@ from nemo_skills.inference.generate import GenerateSolutionsConfig, GenerationTa
 from nemo_skills.utils import get_help_message, setup_logging
 
 
+def load_lang_libs():
+    """Load language libraries from lang_libs.py file."""
+    lang_libs_path = Path(__file__).parent / "lang_libs.py"
+
+    if not lang_libs_path.exists():
+        raise FileNotFoundError(f"lang_libs.py not found at {lang_libs_path}")
+
+    # Read the file content and parse as JSON (since it's a JSON-like dict)
+    with open(lang_libs_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Parse the content as JSON
+    try:
+        lang_libs = json.loads(content)
+        return lang_libs
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse lang_libs.py as JSON: {e}")
+
+
 @nested_dataclass(kw_only=True)
 class ReasoningWithForcedLangConfig(GenerateSolutionsConfig):
     """Configuration for reasoning with forced language generation task.
@@ -55,9 +75,32 @@ class ReasoningWithForcedLangConfig(GenerateSolutionsConfig):
     - Ensuring consistent output formatting
     """
 
-    forced_prefix: str = ""  # Prefix to force at the beginning of reasoning chain
+    language: str = ""  # Language code to use for forced prefix and system message
+    """
+    Language code to automatically load system prompt and reasoning prefix from lang_libs.py.
+
+    Supported languages:
+    - "en": English
+    - "de": German (Deutsch)
+    - "fr": French (Français)
+    - "es": Spanish (Español)
+    - "it": Italian
+    - "ja": Japanese
+    - "zh": Chinese
+
+    When specified, this will automatically set:
+    - forced_system_message from lang_libs[language]["system_prompt"]
+    - forced_prefix from lang_libs[language]["reasoning_prefix"]
+
+    If you want to override these individually, you can still use the manual parameters below.
+    """
+
+    forced_prefix: str = ""  # Manual override for prefix (optional if language is set)
     """
     String to force at the beginning of the model's response.
+
+    If 'language' parameter is set, this will be automatically loaded from lang_libs.py.
+    You can still override it manually by setting this parameter.
 
     Examples:
     - "<think> Ich muss auf Deutsch denken" (force German thinking)
@@ -68,9 +111,12 @@ class ReasoningWithForcedLangConfig(GenerateSolutionsConfig):
     will continue generation from that point.
     """
 
-    forced_system_message: str = ""  # Custom system message to override the default
+    forced_system_message: str = ""  # Manual override for system message (optional if language is set)
     """
     Custom system message to use instead of the default system message.
+
+    If 'language' parameter is set, this will be automatically loaded from lang_libs.py.
+    You can still override it manually by setting this parameter.
 
     Examples:
     - "Sie sind ein hilfreicher Assistent. Sie dürfen nur auf Deutsch denken und antworten."
@@ -98,7 +144,14 @@ class ReasoningWithForcedLangTask(GenerationTask):
     the model follows a specific reasoning pattern.
 
     Usage example:
-        # Command line usage:
+        # Command line usage with language parameter (recommended):
+        python reasoning_with_forced_lang.py \
+            input_file=data.jsonl \
+            output_file=results.jsonl \
+            language=de \
+            server.model=llama-3.1-70b
+
+        # Command line usage with manual parameters:
         python reasoning_with_forced_lang.py \
             input_file=data.jsonl \
             output_file=results.jsonl \
@@ -110,8 +163,7 @@ class ReasoningWithForcedLangTask(GenerationTask):
         cfg = ReasoningWithForcedLangConfig(
             input_file="data.jsonl",
             output_file="results.jsonl",
-            forced_prefix="<think> Let me think step by step:",
-            forced_system_message="You are a helpful assistant that thinks step by step.",
+            language="de",  # Automatically loads German prompts
             server={"model": "llama-3.1-70b"}
         )
         task = ReasoningWithForcedLangTask(cfg)
@@ -139,7 +191,30 @@ class ReasoningWithForcedLangTask(GenerationTask):
     def __init__(self, cfg: ReasoningWithForcedLangConfig):
         """Initialize the reasoning with forced language task."""
         super().__init__(cfg)
-        # Add any custom initialization here
+
+        # Load language settings if language parameter is specified
+        if cfg.language:
+            try:
+                lang_libs = load_lang_libs()
+                if cfg.language not in lang_libs:
+                    available_langs = list(lang_libs.keys())
+                    raise ValueError(f"Language '{cfg.language}' not supported. Available: {available_langs}")
+
+                # Set forced_prefix and forced_system_message from lang_libs if not manually overridden
+                lang_config = lang_libs[cfg.language]
+
+                if not cfg.forced_prefix:
+                    cfg.forced_prefix = lang_config["reasoning_prefix"]
+
+                if not cfg.forced_system_message:
+                    cfg.forced_system_message = lang_config["system_prompt"]
+
+                print(f"Loaded language settings for '{cfg.language}':")
+                print(f"  System prompt: {cfg.forced_system_message}")
+                print(f"  Reasoning prefix: {cfg.forced_prefix}")
+
+            except Exception as e:
+                raise RuntimeError(f"Failed to load language settings for '{cfg.language}': {e}")
 
     def preprocess_data(self, data):
         """
