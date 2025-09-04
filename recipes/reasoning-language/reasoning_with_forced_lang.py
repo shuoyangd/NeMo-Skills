@@ -68,6 +68,18 @@ class ReasoningWithForcedLangConfig(GenerateSolutionsConfig):
     will continue generation from that point.
     """
 
+    forced_system_message: str = ""  # Custom system message to override the default
+    """
+    Custom system message to use instead of the default system message.
+
+    Examples:
+    - "Sie sind ein hilfreicher Assistent. Sie dürfen nur auf Deutsch denken und antworten."
+    - "You are a helpful assistant that thinks step by step."
+    - "You are a math tutor. Always show your work clearly."
+
+    If provided, this will override any default system message from the prompt configuration.
+    """
+
     # Additional parameters you can add:
     # forced_language: str = "French"  # Language to force the model to use
     # reasoning_type: str = "step_by_step"  # Type of reasoning to apply
@@ -91,6 +103,7 @@ class ReasoningWithForcedLangTask(GenerationTask):
             input_file=data.jsonl \
             output_file=results.jsonl \
             forced_prefix="<think> Ich muss auf Deutsch denken" \
+            forced_system_message="Sie sind ein hilfreicher Assistent. Sie dürfen nur auf Deutsch denken und antworten." \
             server.model=llama-3.1-70b
 
         # Programmatic usage:
@@ -98,6 +111,7 @@ class ReasoningWithForcedLangTask(GenerationTask):
             input_file="data.jsonl",
             output_file="results.jsonl",
             forced_prefix="<think> Let me think step by step:",
+            forced_system_message="You are a helpful assistant that thinks step by step.",
             server={"model": "llama-3.1-70b"}
         )
         task = ReasoningWithForcedLangTask(cfg)
@@ -197,14 +211,20 @@ class ReasoningWithForcedLangTask(GenerationTask):
         # Get the base prompt first
         filled_prompt = super().fill_prompt(data_point, data)
 
-        # Add custom prompt modifications here
-        # Example: add language forcing instructions
-        # if isinstance(filled_prompt, list):
-        #     # OpenAI format (list of messages)
-        #     filled_prompt[-1]["content"] += f"\n\nPlease respond in {self.cfg.forced_language}."
-        # else:
-        #     # String format
-        #     filled_prompt += f"\n\nPlease respond in {self.cfg.forced_language}."
+        # Override system message if forced_system_message is provided
+        if self.cfg.forced_system_message:
+            if isinstance(filled_prompt, list):
+                # OpenAI format (list of messages) - find and replace system message
+                for i, message in enumerate(filled_prompt):
+                    if message.get("role") == "system":
+                        filled_prompt[i]["content"] = self.cfg.forced_system_message
+                        break
+                else:
+                    # No system message found, add one at the beginning
+                    filled_prompt.insert(0, {"role": "system", "content": self.cfg.forced_system_message})
+            else:
+                # String format - prepend system message
+                filled_prompt = f"System: {self.cfg.forced_system_message}\n\n{filled_prompt}"
 
         return filled_prompt
 
