@@ -1,0 +1,45 @@
+cluster: cw-dfw-cpu
+base_output_dir: /lustre/fsw/portfolios/llmservice/users/shuoyangd/nano-v3-ablation/ratio_ablation_2603/remixes
+expname: data-remix
+suffix: demo
+
+pipeline_stages:
+  - separate_data
+  - remix_data
+  - convert_to_sft
+
+directories:
+  step-1-separate: ${base_output_dir}/step-1-separate
+  step-2-remix:    ${base_output_dir}/step-2-remix
+  step-3-sft:      ${base_output_dir}/step-3-sft
+
+stages:
+  separate_data:
+    input_file: /lustre/fsw/portfolios/llmservice/users/shuoyangd/nano-v3-ablation/ratio_ablation_2603/blend_jan28.jsonl
+    output_dir: ${directories.step-1-separate}
+    # Regex matched against metadata.domain; instances that match go to target
+    domain_regex: "^multilingual"
+    jobs: 64
+    batch: 1000
+    dependencies: null
+
+  remix_data:
+    target_file:     ${directories.step-1-separate}/target.jsonl
+    non_target_file: ${directories.step-1-separate}/non_target.jsonl
+    output_dir:      ${directories.step-2-remix}
+    # Single ratio or a list — a separate output file is produced for each
+    target_ratio:
+      - 0.025
+      - 0.05
+      - 0.1
+    seed: 42
+    jobs: 64
+    batch: 1000
+    dependencies:
+      - separate_data
+
+  convert_to_sft:
+    input_dir:  ${directories.step-2-remix}
+    output_dir: ${directories.step-3-sft}
+    dependencies:
+      - remix_data
