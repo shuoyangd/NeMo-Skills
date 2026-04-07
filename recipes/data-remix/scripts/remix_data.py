@@ -23,6 +23,12 @@ For each requested ratio r (fraction of target instances in the final mix):
 
 Memory-efficient: only the sampled lines are held in memory, not the full files.
 Multiple ratio outputs are written in parallel via -j/--jobs.
+
+NOTE on output ordering: the output is NOT a uniform shuffle of the combined lines.
+Within each source (target / non-target), lines appear in their original file order.
+What is randomized is (a) which lines are selected and (b) how the two streams are
+interleaved. This is sufficient for training data purposes but callers that require
+a true uniform shuffle should post-process the output.
 """
 
 import argparse
@@ -42,34 +48,33 @@ def count_lines(path):
     return n
 
 
-def sample_lines(path, indices):
-    """Stream through file, returning only lines at the given sorted indices.
-
-    Indices must be sorted in ascending order.
-    """
-    indices = sorted(indices)
+def stream_sample(path, indices):
+    """Generator: stream through file, yielding only lines at the given sorted indices."""
     idx_iter = iter(indices)
     next_idx = next(idx_iter, None)
     if next_idx is None:
-        return []
+        return
 
-    sampled = []
     line_num = 0
     with open(path) as f:
         for raw in f:
             if not raw.strip():
                 continue
             if line_num == next_idx:
-                sampled.append(raw.strip())
+                yield raw.strip()
                 next_idx = next(idx_iter, None)
                 if next_idx is None:
                     break
             line_num += 1
-    return sampled
 
 
 def write_remix(args):
-    """Worker: sample and write one remixed output file for a given ratio."""
+    """Worker: sample and write one remixed output file for a given ratio.
+
+    Memory-efficient: builds a shuffled interleaving plan (list of booleans) and
+    streams target/non-target lines one at a time following that plan, so only one
+    line is held in memory at a time.
+    """
     target_file, non_target_file, n_target, n_non_target, ratio, output_path, seed = args
 
     if not (0.0 < ratio < 1.0):
@@ -86,17 +91,20 @@ def write_remix(args):
     target_indices = sorted(rng.sample(range(n_target), target_count))
     non_target_indices = sorted(rng.sample(range(n_non_target), non_target_count))
 
-    target_lines = sample_lines(target_file, target_indices)
-    non_target_lines = sample_lines(non_target_file, non_target_indices)
+    # Shuffled interleaving plan: True = take next from target, False = from non-target.
+    # This is just a list of booleans — negligible memory.
+    plan = [True] * target_count + [False] * non_target_count
+    rng.shuffle(plan)
 
-    combined = target_lines + non_target_lines
-    rng.shuffle(combined)
+    target_stream = stream_sample(target_file, target_indices)
+    non_target_stream = stream_sample(non_target_file, non_target_indices)
 
     with open(output_path, "w") as f:
-        for line in combined:
+        for take_target in plan:
+            line = next(target_stream) if take_target else next(non_target_stream)
             f.write(line + "\n")
 
-    return ratio, target_count, non_target_count, len(combined)
+    return ratio, target_count, non_target_count, total
 
 
 def main():

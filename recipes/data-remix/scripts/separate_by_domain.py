@@ -84,25 +84,24 @@ def main():
     n_non_target = 0
     n_malformed = 0
 
-    pool = multiprocessing.Pool(processes=args.jobs)
-    try:
-        with (
-            open(args.input_file) as fin,
-            open(target_path, "w") as f_target,
-            open(non_target_path, "w") as f_non_target,
-        ):
+    def batch_iter():
+        with open(args.input_file) as fin:
             batch = []
-            async_results = []
             for line in fin:
                 batch.append(line)
                 if len(batch) >= args.batch:
-                    async_results.append(pool.apply_async(process_batch, ((batch, args.domain_regex),)))
+                    yield (batch, args.domain_regex)
                     batch = []
             if batch:
-                async_results.append(pool.apply_async(process_batch, ((batch, args.domain_regex),)))
+                yield (batch, args.domain_regex)
 
-            for res in async_results:
-                target_lines, non_target_lines, n_bad = res.get()
+    pool = multiprocessing.Pool(processes=args.jobs)
+    try:
+        with (
+            open(target_path, "w") as f_target,
+            open(non_target_path, "w") as f_non_target,
+        ):
+            for target_lines, non_target_lines, n_bad in pool.imap(process_batch, batch_iter()):
                 for line in target_lines:
                     f_target.write(line + "\n")
                 for line in non_target_lines:
