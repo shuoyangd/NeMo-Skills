@@ -73,6 +73,7 @@ def remix_data(cluster, expname, run_after, stage_config, code_dir, **kwargs):
     seed = stage_config.get("seed", 42)
     jobs = stage_config.get("jobs", None)
     batch = stage_config.get("batch", None)
+    fixed_non_target_pool = stage_config.get("fixed_non_target_pool", True)
 
     cmd = (
         f"python {code_dir}/recipes/data-remix/scripts/remix_data.py "
@@ -81,6 +82,7 @@ def remix_data(cluster, expname, run_after, stage_config, code_dir, **kwargs):
         f"    --output_dir {output_dir} "
         f"    --target_ratio '{target_ratio_str}' "
         f"    --seed {seed} "
+        f"    {'--fixed_non_target_pool' if fixed_non_target_pool else '--no_fixed_non_target_pool'} "
         + (f"    -j {jobs} " if jobs is not None else "")
         + (f"    -b {batch} " if batch is not None else "")
     )
@@ -99,6 +101,10 @@ def convert_to_sft(cluster, expname, run_after, stage_config, code_dir, **kwargs
     """Convert each remixed file from OAI format to SFT format."""
     input_dir = stage_config["input_dir"]
     output_dir = stage_config["output_dir"]
+    model = stage_config["model"]
+
+    jobs = stage_config.get("jobs", None)
+    batch = stage_config.get("batch", None)
 
     # Glob pattern covers all remixed files produced by remix_data
     cmd = (
@@ -106,9 +112,12 @@ def convert_to_sft(cluster, expname, run_after, stage_config, code_dir, **kwargs
         f"for f in {input_dir}/remix_r*.jsonl; do "
         f"    base=$(basename $f .jsonl); "
         f"    python {code_dir}/recipes/data-remix/scripts/oai_to_sft.py "
-        f"        --input_file $f "
-        f"        --output_file {output_dir}/${{base}}_sft.jsonl "
-        f"        {stage_config.get('inline_args', '')}; "
+        f"        $f "
+        f"        -m {model} "
+        f"        -o {output_dir}/${{base}}_sft.jsonl "
+        + (f"        -j {jobs} " if jobs is not None else "")
+        + (f"        -b {batch} " if batch is not None else "")
+        + f"        {stage_config.get('inline_args', '')}; "
         f"done"
     )
     run_cmd(

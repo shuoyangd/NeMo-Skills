@@ -24,6 +24,14 @@ For each requested ratio r (fraction of target instances in the final mix):
 Memory-efficient: only the sampled lines are held in memory, not the full files.
 Multiple ratio outputs are written in parallel via -j/--jobs.
 
+Fixed non-target pool (default, --fixed_non_target_pool):
+  When multiple ratios are given, the non-target pool is fixed to the size determined
+  by the highest target ratio (the most constrained case). For lower ratios, the
+  required larger non-target count is achieved by oversampling (with replacement) from
+  that fixed pool. This ensures the non-target data distribution is held constant
+  across ratios so that only the target ratio varies between runs.
+  Use --no_fixed_non_target_pool to revert to independent sampling per ratio.
+
 NOTE on output ordering: the output is NOT a uniform shuffle of the combined lines.
 Within each source (target / non-target), lines appear in their original file order.
 What is randomized is (a) which lines are selected and (b) how the two streams are
@@ -74,8 +82,13 @@ def write_remix(args):
     Memory-efficient: builds a shuffled interleaving plan (list of booleans) and
     streams target/non-target lines one at a time following that plan, so only one
     line is held in memory at a time.
+
+    fixed_non_target_indices: if provided, the non-target pool is fixed to these
+    indices (sorted, from the highest-ratio run). The required non_target_count for
+    this ratio may exceed the pool size, in which case indices are oversampled with
+    replacement. If None, non-target indices are sampled independently for this ratio.
     """
-    target_file, non_target_file, n_target, n_non_target, ratio, output_path, seed = args
+    target_file, non_target_file, n_target, n_non_target, ratio, output_path, seed, fixed_non_target_indices = args
 
     if not (0.0 < ratio < 1.0):
         raise ValueError(f"ratio must be strictly between 0 and 1, got {ratio}")
@@ -89,7 +102,16 @@ def write_remix(args):
 
     rng = random.Random(seed)
     target_indices = sorted(rng.sample(range(n_target), target_count))
-    non_target_indices = sorted(rng.sample(range(n_non_target), non_target_count))
+
+    if fixed_non_target_indices is not None:
+        pool = fixed_non_target_indices
+        if non_target_count <= len(pool):
+            non_target_indices = sorted(rng.sample(pool, non_target_count))
+        else:
+            # Oversample with replacement from the fixed pool
+            non_target_indices = sorted(rng.choices(pool, k=non_target_count))
+    else:
+        non_target_indices = sorted(rng.sample(range(n_non_target), non_target_count))
 
     # Shuffled interleaving plan: True = take next from target, False = from non-target.
     # This is just a list of booleans — negligible memory.
@@ -128,6 +150,15 @@ def main():
     parser.add_argument(
         "-b", "--batch", type=int, default=500, help="Unused; kept for interface consistency with other scripts"
     )
+    parser.add_argument(
+        "--fixed_non_target_pool",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fix the non-target pool to the size determined by the highest target ratio, "
+        "and oversample from it for lower ratios. Ensures non-target distribution is "
+        "held constant across ratios. Use --no_fixed_non_target_pool to sample "
+        "independently per ratio (default: enabled).",
+    )
     args = parser.parse_args()
 
     ratios = [float(r.strip()) for r in args.target_ratio.split(",")]
@@ -142,12 +173,33 @@ def main():
     print(f"Target size         : {n_target}")
     print(f"Non-target size     : {n_non_target}")
 
+    # Compute fixed non-target pool using the highest (most constrained) ratio
+    if args.fixed_non_target_pool and len(ratios) > 0:
+        anchor_ratio = max(ratios)
+        max_total = min(n_target / anchor_ratio, n_non_target / (1.0 - anchor_ratio))
+        anchor_total = math.floor(max_total)
+        anchor_non_target_count = anchor_total - round(anchor_total * anchor_ratio)
+        rng = random.Random(args.seed)
+        fixed_non_target_indices = sorted(rng.sample(range(n_non_target), anchor_non_target_count))
+        print(f"Fixed non-target pool size: {len(fixed_non_target_indices)} (anchored to ratio={anchor_ratio})")
+    else:
+        fixed_non_target_indices = None
+
     worker_args = []
     for ratio in ratios:
         ratio_str = f"{ratio:.4f}".rstrip("0").rstrip(".")
         out_path = output_dir / f"remix_r{ratio_str}.jsonl"
         worker_args.append(
-            (args.target_file, args.non_target_file, n_target, n_non_target, ratio, out_path, args.seed)
+            (
+                args.target_file,
+                args.non_target_file,
+                n_target,
+                n_non_target,
+                ratio,
+                out_path,
+                args.seed,
+                fixed_non_target_indices,
+            )
         )
 
     n_workers = min(args.jobs, len(ratios))

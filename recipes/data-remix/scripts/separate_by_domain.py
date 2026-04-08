@@ -43,9 +43,9 @@ def process_batch(args):
             continue
         domain = instance.get("metadata", {}).get("domain", None)
         if domain is not None and bool(pattern.search(domain)):
-            target.append(json.dumps(instance))
+            target.append(line)
         else:
-            non_target.append(json.dumps(instance))
+            non_target.append(line)
     return target, non_target, n_malformed
 
 
