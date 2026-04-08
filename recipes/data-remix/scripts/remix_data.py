@@ -56,12 +56,19 @@ def count_lines(path):
     return n
 
 
-def stream_sample(path, indices):
-    """Generator: stream through file, yielding only lines at the given sorted indices."""
-    idx_iter = iter(indices)
-    next_idx = next(idx_iter, None)
-    if next_idx is None:
+def stream_sample(path, index_counts):
+    """Generator: stream through file once, yielding each line at a pool index
+    consecutively according to its count in index_counts.
+
+    index_counts: dict mapping line index -> number of times to yield that line.
+    Keys must be a subset of valid line indices; iteration is in ascending index order.
+    """
+    if not index_counts:
         return
+
+    sorted_indices = sorted(index_counts.keys())
+    idx_iter = iter(sorted_indices)
+    next_idx = next(idx_iter, None)
 
     line_num = 0
     with open(path) as f:
@@ -69,11 +76,34 @@ def stream_sample(path, indices):
             if not raw.strip():
                 continue
             if line_num == next_idx:
-                yield raw.strip()
+                for _ in range(index_counts[next_idx]):
+                    yield raw.strip()
                 next_idx = next(idx_iter, None)
                 if next_idx is None:
                     break
             line_num += 1
+
+
+def _build_index_counts(indices):
+    """Build a {line_index: count} dict from a list of indices (may contain duplicates)."""
+    counts = {}
+    for idx in indices:
+        counts[idx] = counts.get(idx, 0) + 1
+    return counts
+
+
+def _oversample_index_counts(pool, non_target_count, rng):
+    """Build index_counts for oversampling pool to non_target_count lines.
+
+    Strategy: every pool line appears floor(non_target_count / pool_size) times,
+    plus a random sample of remainder lines gets one extra copy. This ensures
+    each pool line is represented as uniformly as possible.
+    """
+    pool_size = len(pool)
+    full_copies = non_target_count // pool_size
+    remainder_count = non_target_count - full_copies * pool_size
+    remainder_set = set(rng.sample(pool, remainder_count))
+    return {idx: full_copies + (1 if idx in remainder_set else 0) for idx in pool}
 
 
 def write_remix(args):
@@ -84,9 +114,10 @@ def write_remix(args):
     line is held in memory at a time.
 
     fixed_non_target_indices: if provided, the non-target pool is fixed to these
-    indices (sorted, from the highest-ratio run). The required non_target_count for
-    this ratio may exceed the pool size, in which case indices are oversampled with
-    replacement. If None, non-target indices are sampled independently for this ratio.
+    indices (sorted, from the highest-ratio run). When non_target_count exceeds the
+    pool size, oversampling repeats the pool uniformly (floor copies each, with a
+    random subset getting one extra). If None, non-target indices are sampled
+    independently for this ratio.
     """
     target_file, non_target_file, n_target, n_non_target, ratio, output_path, seed, fixed_non_target_indices = args
 
@@ -102,24 +133,24 @@ def write_remix(args):
 
     rng = random.Random(seed)
     target_indices = sorted(rng.sample(range(n_target), target_count))
+    target_index_counts = _build_index_counts(target_indices)
 
     if fixed_non_target_indices is not None:
         pool = fixed_non_target_indices
         if non_target_count <= len(pool):
-            non_target_indices = sorted(rng.sample(pool, non_target_count))
+            non_target_index_counts = _build_index_counts(rng.sample(pool, non_target_count))
         else:
-            # Oversample with replacement from the fixed pool
-            non_target_indices = sorted(rng.choices(pool, k=non_target_count))
+            non_target_index_counts = _oversample_index_counts(pool, non_target_count, rng)
     else:
-        non_target_indices = sorted(rng.sample(range(n_non_target), non_target_count))
+        non_target_index_counts = _build_index_counts(rng.sample(range(n_non_target), non_target_count))
 
     # Shuffled interleaving plan: True = take next from target, False = from non-target.
     # This is just a list of booleans — negligible memory.
     plan = [True] * target_count + [False] * non_target_count
     rng.shuffle(plan)
 
-    target_stream = stream_sample(target_file, target_indices)
-    non_target_stream = stream_sample(non_target_file, non_target_indices)
+    target_stream = stream_sample(target_file, target_index_counts)
+    non_target_stream = stream_sample(non_target_file, non_target_index_counts)
 
     with open(output_path, "w") as f:
         for take_target in plan:
