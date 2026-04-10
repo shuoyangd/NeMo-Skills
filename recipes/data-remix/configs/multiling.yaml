@@ -41,7 +41,7 @@ stages:
   convert_to_sft:
     input_dir:  ${directories.step-2-remix}
     output_dir: ${directories.step-3-sft}
-    model: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16  # required: HuggingFace model name or path for chat template, e.g. Qwen/Qwen2.5-32B-Instruct
+    model: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
     jobs: 64
     batch: 1000
     dependencies:

@@ -37,5 +37,12 @@ stages:
   convert_to_sft:
     input_dir:  ${directories.step-2-remix}
     output_dir: ${directories.step-3-sft}
+    model: ???  # required: HuggingFace model name or path, e.g. nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+    # Optional overrides (all default to oai_to_sft.py defaults if omitted):
+    # reasoning_open:    ""       # e.g. "[THINK]" for Mistral Reasoning
+    # reasoning_close:   ""       # e.g. "[/THINK]"
+    # thinking_start:    "<think>\n"
+    # thinking_placement: input   # input | output | best-effort-input
+    # default_system:    ""       # set to null to use --no-default-system
     dependencies:
       - remix_data

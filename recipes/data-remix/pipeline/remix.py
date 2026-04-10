@@ -105,6 +105,12 @@ def convert_to_sft(cluster, expname, run_after, stage_config, code_dir, **kwargs
 
     jobs = stage_config.get("jobs", None)
     batch = stage_config.get("batch", None)
+    reasoning_open = stage_config.get("reasoning_open", None)
+    reasoning_close = stage_config.get("reasoning_close", None)
+    thinking_start = stage_config.get("thinking_start", None)
+    thinking_placement = stage_config.get("thinking_placement", None)
+    # default_system=None means --no-default-system; omitting the key uses the script default
+    default_system = stage_config.get("default_system", ...)
 
     # Glob pattern covers all remixed files produced by remix_data
     cmd = (
@@ -117,6 +123,16 @@ def convert_to_sft(cluster, expname, run_after, stage_config, code_dir, **kwargs
         f"        -o {output_dir}/${{base}}_sft.jsonl "
         + (f"        -j {jobs} " if jobs is not None else "")
         + (f"        -b {batch} " if batch is not None else "")
+        + (f"        --reasoning-open '{reasoning_open}' " if reasoning_open is not None else "")
+        + (f"        --reasoning-close '{reasoning_close}' " if reasoning_close is not None else "")
+        + (f"        --thinking-start '{thinking_start}' " if thinking_start is not None else "")
+        + (f"        --thinking-placement {thinking_placement} " if thinking_placement is not None else "")
+        + ("        --no-default-system " if default_system is None else "")
+        + (
+            f"        --default-system '{default_system}' "
+            if default_system is not ... and default_system is not None
+            else ""
+        )
         + f"        {stage_config.get('inline_args', '')}; "
         f"done"
     )
