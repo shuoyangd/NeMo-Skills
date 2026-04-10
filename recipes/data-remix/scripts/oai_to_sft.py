@@ -1,7 +1,13 @@
 import argparse
+import functools
 import json
 import multiprocessing
 import sys
+
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:
+    _tqdm = None
 
 _processor = None
 
@@ -243,53 +249,44 @@ def main():
             initargs=(args.model,),
         )
 
-        with open(args.input, "r", encoding="utf-8") as f:
-            batch, async_results = [], []
-            for line in f:
-                batch.append(line)
-                if len(batch) >= args.batch:
-                    async_results.append(
-                        pool.apply_async(
-                            worker,
-                            (
-                                batch,
-                                args.reasoning_open,
-                                args.reasoning_close,
-                                args.thinking_start,
-                                args.default_system,
-                                args.thinking_placement,
-                            ),
-                        )
-                    )
-                    batch = []
-            if batch:
-                async_results.append(
-                    pool.apply_async(
-                        worker,
-                        (
-                            batch,
-                            args.reasoning_open,
-                            args.reasoning_close,
-                            args.thinking_start,
-                            args.default_system,
-                            args.thinking_placement,
-                        ),
-                    )
-                )
+        worker_fn = functools.partial(
+            worker,
+            reasoning_open=args.reasoning_open,
+            reasoning_close=args.reasoning_close,
+            thinking_start=args.thinking_start,
+            default_system=args.default_system,
+            placement=args.thinking_placement,
+        )
+
+        def _batches(path, batch_size):
+            with open(path, "r", encoding="utf-8") as f:
+                batch = []
+                for line in f:
+                    batch.append(line)
+                    if len(batch) >= batch_size:
+                        yield batch
+                        batch = []
+                if batch:
+                    yield batch
 
         ok = 0
         skipped = 0
-        for res in async_results:
-            try:
-                lines, errors = res.get()
-            except ThinkingStartError as e:
-                print(f"Fatal (--thinking-placement input): {e}", file=sys.stderr)
-                pool.terminate()
-                sys.exit(1)
-            for line in lines:
-                out_file.write(line + "\n")
-                ok += 1
-            skipped += errors
+        bar = _tqdm(unit="lines", unit_scale=True, desc="Converting", file=sys.stderr) if _tqdm else None
+        try:
+            for results, errors in pool.imap(worker_fn, _batches(args.input, args.batch)):
+                for line in results:
+                    out_file.write(line + "\n")
+                    ok += 1
+                skipped += errors
+                if bar is not None:
+                    bar.update(len(results) + errors)
+        except ThinkingStartError as e:
+            print(f"Fatal (--thinking-placement input): {e}", file=sys.stderr)
+            pool.terminate()
+            sys.exit(1)
+        finally:
+            if bar is not None:
+                bar.close()
 
         print(f"Converted: {ok}, Skipped: {skipped}", file=sys.stderr)
 
