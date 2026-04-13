@@ -242,16 +242,16 @@ def main():
 
     start_time = time.time()
 
-    # Read all lines
-    print("Reading input file...")
-    with open(args.input_file, "r") as f:
-        lines = f.readlines()
-
-    total_lines = len(lines)
+    # Count lines without loading file into memory
+    print("Counting lines...")
+    with open(args.input_file, "rb") as f:
+        total_lines = sum(1 for _ in f)
     print(f"Total lines: {total_lines:,}")
 
-    # Prepare tasks
-    tasks = [(i + 1, line, args.extra_info) for i, line in enumerate(lines)]
+    def task_iter():
+        with open(args.input_file) as f:
+            for i, line in enumerate(f):
+                yield (i + 1, line, args.extra_info)
 
     # Process in parallel
     print(f"Processing with {args.workers} workers...")
@@ -261,33 +261,21 @@ def main():
     tokens_output_path = args.tokens_file if args.tokens_file else f"{args.output_file}.tokens.jsonl"
     with open(args.output_file, "w") as outfile, open(tokens_output_path, "w") as tokenfile:
         with Pool(processes=args.workers, initializer=init_worker, initargs=(args.model, args.chat_template)) as pool:
-            # Process in batches with progress bar
-            for i in tqdm(range(0, len(tasks), args.batch_size), desc="Processing batches"):
-                batch = tasks[i : i + args.batch_size]
-                results = pool.map(process_line, batch)
-
-                for result, line_num, error in results:
-                    if result is not None:
-                        output_lines, token_counts = result
-                        # Write all results for this conversation
-                        for output_line, token_count in zip(output_lines, token_counts):
-                            outfile.write(output_line + "\n")
-                            # Each line is a valid JSON value (integer) per JSONL
-                            tokenfile.write(f"{token_count}\n")
-                        passed_count += 1
-                    else:
-                        failed_count += 1
-                        if error and failed_count <= 10:  # Show first 10 errors
-                            tqdm.write(f"Line {line_num}: {error}")
-
-                # Update progress every batch
-                if i % (args.batch_size * 10) == 0:
-                    elapsed = time.time() - start_time
-                    rate = (passed_count + failed_count) / elapsed if elapsed > 0 else 0
-                    success_rate = (
-                        passed_count / (passed_count + failed_count) * 100 if (passed_count + failed_count) > 0 else 0
-                    )
-                    tqdm.write(f"Speed: {rate:.1f} lines/sec | Success: {success_rate:.1f}%")
+            for result, line_num, error in tqdm(
+                pool.imap(process_line, task_iter(), chunksize=args.batch_size),
+                total=total_lines,
+                desc="Processing",
+            ):
+                if result is not None:
+                    output_lines, token_counts = result
+                    for output_line, token_count in zip(output_lines, token_counts):
+                        outfile.write(output_line + "\n")
+                        tokenfile.write(f"{token_count}\n")
+                    passed_count += 1
+                else:
+                    failed_count += 1
+                    if error and failed_count <= 10:
+                        tqdm.write(f"Line {line_num}: {error}")
 
     # Final summary
     total_time = time.time() - start_time
