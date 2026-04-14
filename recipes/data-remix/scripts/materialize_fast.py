@@ -35,14 +35,6 @@ def validate_processed_chunks_tokenization(tokenizer, processed_chunks):
     return conversation_tokens == part_tokens, len(conversation_tokens)
 
 
-def init_worker(model_name, chat_template_path):
-    """Initialize tokenizer for each worker process"""
-    global tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    with open(chat_template_path, "r") as f:
-        tokenizer.chat_template = f.read()
-
-
 def process_line(args):
     """Process a single line"""
     line_num, line, extra_info = args
@@ -242,6 +234,15 @@ def main():
 
     start_time = time.time()
 
+    # Load tokenizer once in the main process. Workers inherit it via fork (copy-on-write),
+    # so they never touch the filesystem for tokenizer initialization.
+    print("Loading tokenizer...")
+    global tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    with open(args.chat_template) as f:
+        tokenizer.chat_template = f.read()
+    print("Tokenizer loaded.")
+
     # Count lines without loading file into memory
     print("Counting lines...")
     with open(args.input_file, "rb") as f:
@@ -260,7 +261,7 @@ def main():
 
     tokens_output_path = args.tokens_file if args.tokens_file else f"{args.output_file}.tokens.jsonl"
     with open(args.output_file, "w") as outfile, open(tokens_output_path, "w") as tokenfile:
-        with Pool(processes=args.workers, initializer=init_worker, initargs=(args.model, args.chat_template)) as pool:
+        with Pool(processes=args.workers) as pool:
             for result, line_num, error in tqdm(
                 pool.imap(process_line, task_iter(), chunksize=args.batch_size),
                 total=total_lines,
