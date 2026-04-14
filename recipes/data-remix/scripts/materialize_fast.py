@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+import os
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import argparse
 import json
 import multiprocessing as mp
