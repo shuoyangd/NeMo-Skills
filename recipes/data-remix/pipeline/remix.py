@@ -109,6 +109,7 @@ def convert_to_sft(cluster, expname, run_after, stage_config, code_dir, config=N
     output_dir = stage_config["output_dir"]
     model = stage_config["model"]
     num_shards = stage_config.get("num_shards", 1)
+    rerun_done = stage_config.get("rerun_done", False)
 
     jobs = stage_config.get("jobs", None)
     batch = stage_config.get("batch", None)
@@ -162,9 +163,16 @@ def convert_to_sft(cluster, expname, run_after, stage_config, code_dir, config=N
                 chunk_out_files.append(chunk_out)
                 chunk_token_files.append(chunk_tok)
 
-                # Each shard job: count lines, compute range, extract via sed, run materialize_fast.py
-                # Uses calculate_chunk_indices logic inline in bash for consistency
+                # Each shard job: count lines, compute range, extract via sed if needed,
+                # then run materialize_fast.py. We intentionally reuse an existing
+                # shard_input file to avoid re-running sed on retries / partial reruns.
+                done_guard = (
+                    f'if [ -f {chunk_out}.done ]; then echo "Shard {shard_id} already done, skipping"; exit 0; fi && '
+                    if not rerun_done
+                    else ""
+                )
                 shard_cmd = (
+                    f"{done_guard}"
                     f"mkdir -p {output_dir} && "
                     f"total=$(wc -l < {input_file}) && "
                     f'eval $(python -c "'
@@ -173,12 +181,11 @@ def convert_to_sft(cluster, expname, run_after, stage_config, code_dir, config=N
                     f"print(f'start={{s+1}} end={{e}}')"  # sed is 1-indexed
                     f'") && '
                     f"shard_input={output_dir}/{base}_shard{shard_id}_input.jsonl && "
-                    f'sed -n "${{start}},${{end}}p" {input_file} > $shard_input && '
+                    f'if [ ! -f "$shard_input" ]; then sed -n "${{start}},${{end}}p" {input_file} > "$shard_input"; fi && '
                     f"{materialize_cmd}"
                     f" --input_file $shard_input"
                     f" --output_file {chunk_out}"
                     f" --tokens_file {chunk_tok}"
-                    f" && rm $shard_input"
                     f" && touch {chunk_out}.done {chunk_tok}.done"
                 )
                 shard_exp = f"{expname}-{base}-shard-{shard_id}"
@@ -200,9 +207,11 @@ def convert_to_sft(cluster, expname, run_after, stage_config, code_dir, config=N
             final_tokens = f"{final_out}.tokens.jsonl"
             chunk_outs = " ".join(get_chunked_filename(i, final_out) for i in range(num_shards))
             chunk_toks = " ".join(get_chunked_filename(i, final_tokens) for i in range(num_shards))
+            shard_inputs = " ".join(f"{output_dir}/{base}_shard{i}_input.jsonl" for i in range(num_shards))
             merge_parts.append(
                 f"python -m nemo_skills.inference.merge_chunks {final_out} {chunk_outs} && "
-                f"python -m nemo_skills.inference.merge_chunks {final_tokens} {chunk_toks}"
+                f"python -m nemo_skills.inference.merge_chunks {final_tokens} {chunk_toks} && "
+                f"rm -f {shard_inputs}"
             )
         merge_cmd = " && ".join(merge_parts)
         run_cmd(

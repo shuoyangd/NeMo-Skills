@@ -15,6 +15,8 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 _DEFAULT_CHAT_TEMPLATE = Path(__file__).parent / "chat_template_nemonext.jinja"
+_IM_START = "<|im_start|>"
+_IM_END = "<|im_end|>\n"
 
 
 def replace_json_args(messages):
@@ -30,43 +32,9 @@ def replace_json_args(messages):
     return messages
 
 
-def find_last_user_message_end(messages, tokenizer, enable_thinking=True, tools=None):
-    """Find where the last user message ends in the rendered template"""
-
-    # Find the last user message index
-    last_user_idx = max(i for i, msg in enumerate(messages) if msg["role"] == "user")
-
-    # Render up to the last user message (inclusive)
-    if enable_thinking and (
-        "reasoning_content" not in messages[last_user_idx + 1]
-        or messages[last_user_idx + 1]["reasoning_content"] == ""
-    ):
-        # Manual hack for empty reasoning content mismatch
-        template_up_to_last_user = tokenizer.apply_chat_template(
-            messages[: last_user_idx + 1],
-            tokenize=False,
-            add_generation_prompt=False,
-            tools=tools,
-            chat_template_kwargs={"enable_thinking": enable_thinking},
-        )
-        template_up_to_last_user += "<|im_start|>assistant\n<think></think>"
-    else:
-        template_up_to_last_user = tokenizer.apply_chat_template(
-            messages[: last_user_idx + 1],
-            tokenize=False,
-            add_generation_prompt=True,
-            chat_template_kwargs={"enable_thinking": enable_thinking},
-            tools=tools,
-        )
-
-    return len(template_up_to_last_user)
-
-
-def split_template_into_messages(messages, tokenizer, start_from_last_user=True, enable_thinking=True, tools=None):
-    """Split rendered template back into individual message chunks"""
-
-    # Render full template
-    full_template = tokenizer.apply_chat_template(
+def _render_template(messages, tokenizer, enable_thinking=True, tools=None):
+    """Render a conversation with the Nemotron chat template."""
+    return tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=False,
@@ -74,65 +42,113 @@ def split_template_into_messages(messages, tokenizer, start_from_last_user=True,
         chat_template_kwargs={"enable_thinking": enable_thinking},
     )
 
-    # Get first "message": if starting from last user, this includes all prior assistant turns as well
-    if start_from_last_user:
-        system_end = full_template.find("<|im_end|>\n") + len("<|im_end|>\n")
-        last_user_idx = max(i for i, msg in enumerate(messages) if msg["role"] == "user")
-        last_user_pos = find_last_user_message_end(messages, tokenizer, enable_thinking=enable_thinking, tools=tools)
-        previous_pos = last_user_pos
-        # First chunk: everything up to last user message, split at system boundary
-        result = [
-            {"role": "system", "content": full_template[:system_end]},
-            {"role": "user", "content": full_template[system_end:last_user_pos]},
-        ]
-        message_range = range(last_user_idx + 1, len(messages))
-    else:
-        previous_pos = 0
-        result = []
-        message_range = range(len(messages))
 
-    for i in message_range:
-        # Parallel tool calls
-        if messages[i]["role"] == "tool" and messages[i + 1]["role"] == "tool":
+def _parse_rendered_blocks(rendered_template):
+    """Parse top-level blocks from chat_template_nemonext.jinja output.
+
+    This intentionally overfits to the Nemotron template structure, which emits
+    top-level turns as `<|im_start|>role\\n...<|im_end|>\\n` blocks. We rely on
+    those explicit markers instead of re-rendering conversation prefixes.
+    """
+    blocks = []
+    cursor = 0
+
+    while cursor < len(rendered_template):
+        if not rendered_template.startswith(_IM_START, cursor):
+            snippet = rendered_template[cursor : cursor + 80]
+            raise ValueError(f"Unexpected content outside top-level block at offset {cursor}: {snippet!r}")
+
+        role_start = cursor + len(_IM_START)
+        role_end = rendered_template.find("\n", role_start)
+        if role_end == -1:
+            raise ValueError("Malformed rendered template: missing newline after <|im_start|> role header")
+
+        block_end = rendered_template.find(_IM_END, role_end + 1)
+        if block_end == -1:
+            raise ValueError("Malformed rendered template: missing <|im_end|> terminator")
+
+        block_end += len(_IM_END)
+        blocks.append(
+            {
+                "role": rendered_template[role_start:role_end],
+                "content": rendered_template[cursor:block_end],
+            }
+        )
+        cursor = block_end
+
+    if "".join(block["content"] for block in blocks) != rendered_template:
+        raise ValueError("Parsed blocks do not reconstruct the rendered template")
+
+    return blocks
+
+
+def _logical_chunks_from_rendered(messages, rendered_blocks):
+    """Map rendered top-level blocks back to the logical chunk roles expected downstream.
+
+    This is template-specific:
+    - the template always emits a leading system block
+    - consecutive tool messages are rendered as a single synthetic user block
+    """
+    if not rendered_blocks:
+        return []
+    if rendered_blocks[0]["role"] != "system":
+        raise ValueError("Expected leading system block in rendered template")
+
+    chunks = [{"role": "system", "content": rendered_blocks[0]["content"]}]
+    block_idx = 1
+    msg_idx = 1 if messages and messages[0]["role"] == "system" else 0
+
+    while msg_idx < len(messages):
+        message = messages[msg_idx]
+
+        if message["role"] == "tool":
+            if block_idx >= len(rendered_blocks):
+                raise ValueError("Missing rendered block for tool message group")
+            if rendered_blocks[block_idx]["role"] != "user":
+                raise ValueError("Expected synthetic user block for tool response group")
+
+            while msg_idx < len(messages) and messages[msg_idx]["role"] == "tool":
+                msg_idx += 1
+            chunks.append({"role": "tool", "content": rendered_blocks[block_idx]["content"]})
+            block_idx += 1
             continue
 
-        # Render up to this message
-        if (
-            enable_thinking
-            and messages[i]["role"] != "assistant"
-            and ("reasoning_content" not in messages[i + 1] or messages[i + 1]["reasoning_content"] == "")
-        ):
-            # Manual hack for empty reasoning content mismatch
-            template_up_to_here = tokenizer.apply_chat_template(
-                messages[: i + 1],
-                tokenize=False,
-                add_generation_prompt=False,
-                tools=tools,
-                chat_template_kwargs={"enable_thinking": enable_thinking},
-            )
-            template_up_to_here += "<|im_start|>assistant\n<think></think>"
-        else:
-            # Tool and usermessages need generation prompt, others don't
-            add_gen_prompt = messages[i]["role"] == "tool" or messages[i]["role"] == "user"
-            template_up_to_here = tokenizer.apply_chat_template(
-                messages[: i + 1],
-                tokenize=False,
-                add_generation_prompt=add_gen_prompt,
-                tools=tools,
-                chat_template_kwargs={"enable_thinking": enable_thinking},
-            )
+        if block_idx >= len(rendered_blocks):
+            raise ValueError(f"Missing rendered block for message role {message['role']}")
 
-        current_pos = len(template_up_to_here)
-        chunk_text = full_template[previous_pos:current_pos]
+        chunks.append({"role": message["role"], "content": rendered_blocks[block_idx]["content"]})
+        block_idx += 1
+        msg_idx += 1
 
-        # Verify incremental rendering matches full template
-        if template_up_to_here != full_template[:current_pos]:
-            raise ValueError(f"Template mismatch at message {i}: incremental rendering doesn't match full template")
+    if block_idx != len(rendered_blocks):
+        raise ValueError("Unused rendered blocks remain after reconstructing logical chunks")
 
-        result.append({"role": messages[i]["role"], "content": chunk_text})
-        previous_pos = current_pos
+    return chunks
 
-    return result
+
+def split_template_into_messages(messages, tokenizer, start_from_last_user=True, enable_thinking=True, tools=None):
+    """Split rendered template back into logical message chunks.
+
+    This implementation deliberately overfits to chat_template_nemonext.jinja.
+    It trades generic prefix re-rendering for a single full render plus parsing
+    of the template's explicit top-level markers.
+    """
+    full_template = _render_template(messages, tokenizer, enable_thinking=enable_thinking, tools=tools)
+    rendered_blocks = _parse_rendered_blocks(full_template)
+    logical_chunks = _logical_chunks_from_rendered(messages, rendered_blocks)
+
+    if not start_from_last_user:
+        return logical_chunks
+
+    last_user_chunk_idx = max(i for i, chunk in enumerate(logical_chunks) if chunk["role"] == "user")
+    return [
+        logical_chunks[0],
+        {
+            "role": "user",
+            "content": "".join(chunk["content"] for chunk in logical_chunks[1 : last_user_chunk_idx + 1]),
+        },
+        *logical_chunks[last_user_chunk_idx + 1 :],
+    ]
 
 
 def create_masked_messages(messages, tokenizer, tools=None):
@@ -249,10 +265,7 @@ def process_line(args):
         # Verify each group matches expected template
         all_passed = True
         error_message = None
-        for i, (chunks, messages_i) in enumerate(masked_messages):
-            # Determine if this group has thinking
-            has_thinking = any("reasoning_content" in msg and msg["reasoning_content"] for msg in messages_i)
-
+        for chunks, _ in masked_messages:
             # Additional sanity checks from materialize.py
             for j, obj in enumerate(chunks):
                 if j > 0 and obj["role"] == "assistant" and chunks[j - 1]["role"] == "assistant":
@@ -276,22 +289,12 @@ def process_line(args):
             if not all_passed:
                 break
 
-            # Render the expected template for this group
-            full_template_i = tokenizer.apply_chat_template(
-                messages_i,
-                tokenize=False,
-                add_generation_prompt=False,
-                tools=conversation_tools,
-                chat_template_kwargs={"enable_thinking": has_thinking},
-            )
-
-            # Concatenate the chunks
-            concatenated = "".join([chunk["content"] for chunk in chunks])
-
-            # Verify they match
-            if full_template_i != concatenated:
+            # split_template_into_messages now derives chunk boundaries from a
+            # single parsed full render, so we keep the structural checks here
+            # and avoid re-rendering the same conversation slice again.
+            if "".join(chunk["content"] for chunk in chunks) == "":
                 all_passed = False
-                error_message = "Template mismatch"
+                error_message = "Empty chunk group"
                 break
 
         if not all_passed:
