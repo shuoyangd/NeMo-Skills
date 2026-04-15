@@ -44,6 +44,6 @@ stages:
     model: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
     jobs: 64
     batch: 100
-    num_shards: 8
+    num_shards: 10
     dependencies:
       - remix_data
