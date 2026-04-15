@@ -11,12 +11,160 @@ import time
 from multiprocessing import Pool
 from pathlib import Path
 
-# Import the core functions from materialize.py
-from materialize import create_masked_messages, replace_json_args
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
 _DEFAULT_CHAT_TEMPLATE = Path(__file__).parent / "chat_template_nemonext.jinja"
+
+
+def replace_json_args(messages):
+    """Convert JSON string arguments to dict objects in tool calls."""
+    for i in range(len(messages)):
+        if messages[i]["role"] == "assistant":
+            if messages[i].get("tool_calls"):
+                for j in range(len(messages[i]["tool_calls"])):
+                    if isinstance(messages[i]["tool_calls"][j]["function"]["arguments"], str):
+                        messages[i]["tool_calls"][j]["function"]["arguments"] = json.loads(
+                            messages[i]["tool_calls"][j]["function"]["arguments"]
+                        )
+    return messages
+
+
+def find_last_user_message_end(messages, tokenizer, enable_thinking=True, tools=None):
+    """Find where the last user message ends in the rendered template"""
+
+    # Find the last user message index
+    last_user_idx = max(i for i, msg in enumerate(messages) if msg["role"] == "user")
+
+    # Render up to the last user message (inclusive)
+    if enable_thinking and (
+        "reasoning_content" not in messages[last_user_idx + 1]
+        or messages[last_user_idx + 1]["reasoning_content"] == ""
+    ):
+        # Manual hack for empty reasoning content mismatch
+        template_up_to_last_user = tokenizer.apply_chat_template(
+            messages[: last_user_idx + 1],
+            tokenize=False,
+            add_generation_prompt=False,
+            tools=tools,
+            chat_template_kwargs={"enable_thinking": enable_thinking},
+        )
+        template_up_to_last_user += "<|im_start|>assistant\n<think></think>"
+    else:
+        template_up_to_last_user = tokenizer.apply_chat_template(
+            messages[: last_user_idx + 1],
+            tokenize=False,
+            add_generation_prompt=True,
+            chat_template_kwargs={"enable_thinking": enable_thinking},
+            tools=tools,
+        )
+
+    return len(template_up_to_last_user)
+
+
+def split_template_into_messages(messages, tokenizer, start_from_last_user=True, enable_thinking=True, tools=None):
+    """Split rendered template back into individual message chunks"""
+
+    # Render full template
+    full_template = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        tools=tools,
+        chat_template_kwargs={"enable_thinking": enable_thinking},
+    )
+
+    # Get first "message": if starting from last user, this includes all prior assistant turns as well
+    if start_from_last_user:
+        system_end = full_template.find("<|im_end|>\n") + len("<|im_end|>\n")
+        last_user_idx = max(i for i, msg in enumerate(messages) if msg["role"] == "user")
+        last_user_pos = find_last_user_message_end(messages, tokenizer, enable_thinking=enable_thinking, tools=tools)
+        previous_pos = last_user_pos
+        # First chunk: everything up to last user message, split at system boundary
+        result = [
+            {"role": "system", "content": full_template[:system_end]},
+            {"role": "user", "content": full_template[system_end:last_user_pos]},
+        ]
+        message_range = range(last_user_idx + 1, len(messages))
+    else:
+        previous_pos = 0
+        result = []
+        message_range = range(len(messages))
+
+    for i in message_range:
+        # Parallel tool calls
+        if messages[i]["role"] == "tool" and messages[i + 1]["role"] == "tool":
+            continue
+
+        # Render up to this message
+        if (
+            enable_thinking
+            and messages[i]["role"] != "assistant"
+            and ("reasoning_content" not in messages[i + 1] or messages[i + 1]["reasoning_content"] == "")
+        ):
+            # Manual hack for empty reasoning content mismatch
+            template_up_to_here = tokenizer.apply_chat_template(
+                messages[: i + 1],
+                tokenize=False,
+                add_generation_prompt=False,
+                tools=tools,
+                chat_template_kwargs={"enable_thinking": enable_thinking},
+            )
+            template_up_to_here += "<|im_start|>assistant\n<think></think>"
+        else:
+            # Tool and usermessages need generation prompt, others don't
+            add_gen_prompt = messages[i]["role"] == "tool" or messages[i]["role"] == "user"
+            template_up_to_here = tokenizer.apply_chat_template(
+                messages[: i + 1],
+                tokenize=False,
+                add_generation_prompt=add_gen_prompt,
+                tools=tools,
+                chat_template_kwargs={"enable_thinking": enable_thinking},
+            )
+
+        current_pos = len(template_up_to_here)
+        chunk_text = full_template[previous_pos:current_pos]
+
+        # Verify incremental rendering matches full template
+        if template_up_to_here != full_template[:current_pos]:
+            raise ValueError(f"Template mismatch at message {i}: incremental rendering doesn't match full template")
+
+        result.append({"role": messages[i]["role"], "content": chunk_text})
+        previous_pos = current_pos
+
+    return result
+
+
+def create_masked_messages(messages, tokenizer, tools=None):
+    """Create message chunks, optionally starting from last user message"""
+
+    # Check if conversation has thinking (determines splitting strategy)
+    has_thinking = any("reasoning_content" in msg and msg["reasoning_content"] for msg in messages)
+
+    if has_thinking:
+        # Split based on user messages - create chunks up to each user message
+        user_idxs = [i for i, msg in enumerate(messages) if msg["role"] == "user"]
+        result = []
+        for i in range(len(user_idxs)):
+            if i == len(user_idxs) - 1:
+                # Last user message - include all remaining messages
+                messages_i = messages
+            else:
+                # Include messages up to but not including the next user message
+                messages_i = messages[: user_idxs[i + 1]]
+
+            chunks = split_template_into_messages(
+                messages_i, tokenizer, start_from_last_user=True, enable_thinking=has_thinking, tools=tools
+            )
+
+            result.append((chunks, messages_i))  # Return both chunks and original messages
+        return result
+    else:
+        # Generate one sequence
+        chunks = split_template_into_messages(
+            messages, tokenizer, start_from_last_user=False, enable_thinking=has_thinking, tools=tools
+        )
+        return [(chunks, messages)]  # Return both chunks and original messages
 
 
 def encode_plain_text(tokenizer, text):
@@ -184,9 +332,13 @@ def process_line(args):
                 else:
                     processed_chunks.append(chunk)
 
-            tokens_match, num_tokens = validate_processed_chunks_tokenization(tokenizer, processed_chunks)
-            if not tokens_match:
-                return None, line_num, "Chunk tokenization mismatch"
+            if skip_token_validation:
+                concatenated_processed = "".join(chunk["content"] for chunk in processed_chunks)
+                num_tokens = len(encode_plain_text(tokenizer, concatenated_processed))
+            else:
+                tokens_match, num_tokens = validate_processed_chunks_tokenization(tokenizer, processed_chunks)
+                if not tokens_match:
+                    return None, line_num, "Chunk tokenization mismatch"
 
             # Create output record for this chunk group
             if extra_info:
@@ -226,6 +378,18 @@ def main():
     parser.add_argument("--extra_info", action="store_true", help="Include extra info in output")
     parser.add_argument("-j", "--workers", type=int, default=mp.cpu_count(), help="Number of worker processes")
     parser.add_argument("-b", "--batch_size", type=int, default=4, help="Batch size for processing")
+    parser.add_argument(
+        "--skip-token-validation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip per-chunk tokenization validation for faster processing (default: skip)",
+    )
+    parser.add_argument(
+        "--ordered",
+        action="store_true",
+        default=False,
+        help="Preserve input line ordering in output (slower due to imap vs imap_unordered)",
+    )
 
     args = parser.parse_args()
 
@@ -235,13 +399,16 @@ def main():
     print(f"Chat template: {args.chat_template}")
     print(f"Workers: {args.workers}")
     print(f"Batch size: {args.batch_size}")
+    print(f"Token validation: {'enabled' if not args.skip_token_validation else 'skipped'}")
+    print(f"Output ordering: {'ordered' if args.ordered else 'unordered'}")
 
     start_time = time.time()
 
     # Load tokenizer once in the main process. Workers inherit it via fork (copy-on-write),
     # so they never touch the filesystem for tokenizer initialization.
     print("Loading tokenizer...")
-    global tokenizer
+    global tokenizer, skip_token_validation
+    skip_token_validation = args.skip_token_validation
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     with open(args.chat_template) as f:
         tokenizer.chat_template = f.read()
@@ -266,8 +433,9 @@ def main():
     tokens_output_path = args.tokens_file if args.tokens_file else f"{args.output_file}.tokens.jsonl"
     with open(args.output_file, "w") as outfile, open(tokens_output_path, "w") as tokenfile:
         with Pool(processes=args.workers) as pool:
+            map_fn = pool.imap if args.ordered else pool.imap_unordered
             for result, line_num, error in tqdm(
-                pool.imap(process_line, task_iter(), chunksize=args.batch_size),
+                map_fn(process_line, task_iter(), chunksize=args.batch_size),
                 total=total_lines,
                 desc="Processing",
             ):

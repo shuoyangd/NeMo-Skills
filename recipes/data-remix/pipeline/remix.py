@@ -18,6 +18,7 @@ from pathlib import Path
 from omegaconf import OmegaConf
 
 from nemo_skills.pipeline.cli import run_cmd, wrap_arguments
+from nemo_skills.utils import get_chunked_filename
 
 
 def get_stage_expname(base_expname, stage_name, suffix):
@@ -97,38 +98,122 @@ def remix_data(cluster, expname, run_after, stage_config, code_dir, **kwargs):
     )
 
 
-def convert_to_sft(cluster, expname, run_after, stage_config, code_dir, **kwargs):
-    """Convert each remixed file to SFT format using materialize_fast.py."""
+def convert_to_sft(cluster, expname, run_after, stage_config, code_dir, config=None, **kwargs):
+    """Convert each remixed file to SFT format using materialize_fast.py.
+
+    When num_shards > 1, submits parallel Slurm jobs: one per file × shard.
+    Each shard job extracts its line range via sed, runs materialize_fast.py,
+    then a merge job concatenates the shard outputs using merge_chunks.py.
+    """
     input_dir = stage_config["input_dir"]
     output_dir = stage_config["output_dir"]
     model = stage_config["model"]
+    num_shards = stage_config.get("num_shards", 1)
 
     jobs = stage_config.get("jobs", None)
     batch = stage_config.get("batch", None)
+    inline_args = stage_config.get("inline_args", "")
 
-    # Glob pattern covers all remixed files produced by remix_data
-    cmd = (
-        f"mkdir -p {output_dir} && "
-        f"for f in {input_dir}/remix_r*.jsonl; do "
-        f"    base=$(basename $f .jsonl); "
-        f"    python {code_dir}/recipes/data-remix/scripts/materialize_fast.py "
-        f"        --input_file $f "
-        f"        --output_file {output_dir}/${{base}}_sft.jsonl "
-        f"        -m {model} "
-        + (f"        -j {jobs} " if jobs is not None else "")
-        + (f"        -b {batch} " if batch is not None else "")
-        + f"        {stage_config.get('inline_args', '')}; "
-        f"done"
+    # Derive input filenames from remix_data's target_ratio config
+    remix_config = config["stages"]["remix_data"]
+    target_ratio = remix_config["target_ratio"]
+    if not isinstance(target_ratio, list):
+        target_ratio = [target_ratio]
+    input_files = [(f"remix_r{r}", f"{input_dir}/remix_r{r}.jsonl") for r in target_ratio]
+
+    materialize_cmd = (
+        f"python {code_dir}/recipes/data-remix/scripts/materialize_fast.py"
+        + (f" -j {jobs}" if jobs is not None else "")
+        + (f" -b {batch}" if batch is not None else "")
+        + f" -m {model}"
+        + (f" {inline_args}" if inline_args else "")
     )
-    run_cmd(
-        ctx=wrap_arguments(cmd),
-        cluster=cluster,
-        log_dir=f"{output_dir}/logs",
-        expname=expname,
-        run_after=run_after,
-        num_gpus=0,
-        **stage_config.get("stage_kwargs", {}),
-    )
+
+    if num_shards <= 1:
+        # No sharding — one job per file (still parallelizes across files vs old for-loop)
+        for base, input_file in input_files:
+            cmd = (
+                f"mkdir -p {output_dir} && "
+                f"{materialize_cmd}"
+                f" --input_file {input_file}"
+                f" --output_file {output_dir}/{base}_sft.jsonl"
+            )
+            run_cmd(
+                ctx=wrap_arguments(cmd),
+                cluster=cluster,
+                log_dir=f"{output_dir}/logs",
+                expname=f"{expname}-{base}",
+                run_after=run_after,
+                num_gpus=0,
+                **stage_config.get("stage_kwargs", {}),
+            )
+    else:
+        # Sharded — one job per file × shard, plus a merge job per file
+        shard_expnames = []
+        for base, input_file in input_files:
+            final_out = f"{output_dir}/{base}_sft.jsonl"
+            final_tokens = f"{final_out}.tokens.jsonl"
+            chunk_out_files = []
+            chunk_token_files = []
+
+            for shard_id in range(num_shards):
+                chunk_out = get_chunked_filename(shard_id, final_out)
+                chunk_tok = get_chunked_filename(shard_id, final_tokens)
+                chunk_out_files.append(chunk_out)
+                chunk_token_files.append(chunk_tok)
+
+                # Each shard job: count lines, compute range, extract via sed, run materialize_fast.py
+                # Uses calculate_chunk_indices logic inline in bash for consistency
+                shard_cmd = (
+                    f"mkdir -p {output_dir} && "
+                    f"total=$(wc -l < {input_file}) && "
+                    f'eval $(python -c "'
+                    f"from nemo_skills.file_utils import calculate_chunk_indices; "
+                    f"s, e = calculate_chunk_indices(int($total), {num_shards}, {shard_id}); "
+                    f"print(f'start={{s+1}} end={{e}}')"  # sed is 1-indexed
+                    f'") && '
+                    f"shard_input={output_dir}/{base}_shard{shard_id}_input.jsonl && "
+                    f'sed -n "${{start}},${{end}}p" {input_file} > $shard_input && '
+                    f"{materialize_cmd}"
+                    f" --input_file $shard_input"
+                    f" --output_file {chunk_out}"
+                    f" --tokens_file {chunk_tok}"
+                    f" && rm $shard_input"
+                    f" && touch {chunk_out}.done {chunk_tok}.done"
+                )
+                shard_exp = f"{expname}-{base}-shard-{shard_id}"
+                shard_expnames.append(shard_exp)
+                run_cmd(
+                    ctx=wrap_arguments(shard_cmd),
+                    cluster=cluster,
+                    log_dir=f"{output_dir}/logs",
+                    expname=shard_exp,
+                    run_after=run_after,
+                    num_gpus=0,
+                    **stage_config.get("stage_kwargs", {}),
+                )
+
+        # Merge job — uses merge_chunks.py to concatenate and clean up
+        merge_parts = []
+        for base, _ in input_files:
+            final_out = f"{output_dir}/{base}_sft.jsonl"
+            final_tokens = f"{final_out}.tokens.jsonl"
+            chunk_outs = " ".join(get_chunked_filename(i, final_out) for i in range(num_shards))
+            chunk_toks = " ".join(get_chunked_filename(i, final_tokens) for i in range(num_shards))
+            merge_parts.append(
+                f"python -m nemo_skills.inference.merge_chunks {final_out} {chunk_outs} && "
+                f"python -m nemo_skills.inference.merge_chunks {final_tokens} {chunk_toks}"
+            )
+        merge_cmd = " && ".join(merge_parts)
+        run_cmd(
+            ctx=wrap_arguments(merge_cmd),
+            cluster=cluster,
+            log_dir=f"{output_dir}/logs",
+            expname=f"{expname}-merge",
+            run_after=shard_expnames,
+            num_gpus=0,
+            **stage_config.get("stage_kwargs", {}),
+        )
 
 
 stages_map = {
@@ -221,6 +306,7 @@ if __name__ == "__main__":
             run_after=dependencies,
             stage_config=stage_config,
             code_dir=code_dir,
+            config=config,
         )
 
     print("\n--- Pipeline finished. ---")
