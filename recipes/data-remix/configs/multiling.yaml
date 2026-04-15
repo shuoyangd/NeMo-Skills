@@ -43,7 +43,7 @@ stages:
     output_dir: ${directories.step-3-sft}
     model: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
     jobs: 64
-    batch: 100
+    batch: 1000
     num_shards: 10
     dependencies:
       - remix_data

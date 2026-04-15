@@ -360,6 +360,11 @@ def process_line(args):
         return None, line_num, str(e)
 
 
+def process_batch(batch):
+    """Process a batch of input lines in one worker call."""
+    return [process_line(item) for item in batch]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Simple parallel materialize processor")
     parser.add_argument("--input_file", required=True, help="Input JSONL file")
@@ -380,7 +385,9 @@ def main():
     )
     parser.add_argument("--extra_info", action="store_true", help="Include extra info in output")
     parser.add_argument("-j", "--workers", type=int, default=mp.cpu_count(), help="Number of worker processes")
-    parser.add_argument("-b", "--batch_size", type=int, default=4, help="Batch size for processing")
+    parser.add_argument(
+        "-b", "--batch_size", type=int, default=4, help="Number of input lines processed per worker call"
+    )
     parser.add_argument(
         "--skip-token-validation",
         action=argparse.BooleanOptionalAction,
@@ -395,6 +402,8 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.batch_size < 1:
+        parser.error("--batch_size must be >= 1")
 
     print(f"Input: {args.input_file}")
     print(f"Output: {args.output_file}")
@@ -428,6 +437,16 @@ def main():
             for i, line in enumerate(f):
                 yield (i + 1, line, args.extra_info)
 
+    def batched_task_iter():
+        batch = []
+        for item in task_iter():
+            batch.append(item)
+            if len(batch) >= args.batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
     # Process in parallel
     print(f"Processing with {args.workers} workers...")
     passed_count = 0
@@ -437,21 +456,23 @@ def main():
     with open(args.output_file, "w") as outfile, open(tokens_output_path, "w") as tokenfile:
         with Pool(processes=args.workers) as pool:
             map_fn = pool.imap if args.ordered else pool.imap_unordered
-            for result, line_num, error in tqdm(
-                map_fn(process_line, task_iter(), chunksize=args.batch_size),
-                total=total_lines,
+            for batch_results in tqdm(
+                map_fn(process_batch, batched_task_iter(), chunksize=1),
+                total=(total_lines + args.batch_size - 1) // args.batch_size,
                 desc="Processing",
+                unit="batch",
             ):
-                if result is not None:
-                    output_lines, token_counts = result
-                    for output_line, token_count in zip(output_lines, token_counts):
-                        outfile.write(output_line + "\n")
-                        tokenfile.write(f"{token_count}\n")
-                    passed_count += 1
-                else:
-                    failed_count += 1
-                    if error and failed_count <= 10:
-                        tqdm.write(f"Line {line_num}: {error}")
+                for result, line_num, error in batch_results:
+                    if result is not None:
+                        output_lines, token_counts = result
+                        for output_line, token_count in zip(output_lines, token_counts):
+                            outfile.write(output_line + "\n")
+                            tokenfile.write(f"{token_count}\n")
+                        passed_count += 1
+                    else:
+                        failed_count += 1
+                        if error and failed_count <= 10:
+                            tqdm.write(f"Line {line_num}: {error}")
 
     # Final summary
     total_time = time.time() - start_time
