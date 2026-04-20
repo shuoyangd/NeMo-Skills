@@ -365,6 +365,37 @@ def process_batch(batch):
     return [process_line(item) for item in batch]
 
 
+def read_completed_positions(async_path):
+    """Read async checkpoint file and return set of completed input line positions."""
+    completed = set()
+    if not Path(async_path).exists():
+        return completed
+    with open(async_path, "rt", encoding="utf-8") as fin:
+        for line in fin:
+            try:
+                if line.strip():
+                    completed.add(int(json.loads(line)["_async_position"]))
+            except json.JSONDecodeError:
+                break
+    return completed
+
+
+def restore_async_order(async_path, output_file, tokens_file):
+    """Sort async checkpoint by position, expand into final output + tokens files."""
+    with open(async_path, "rt", encoding="utf-8") as fin:
+        records = [json.loads(line) for line in fin if line.strip()]
+
+    records.sort(key=lambda r: r["_async_position"])
+
+    with open(output_file, "w") as outf, open(tokens_file, "w") as tokf:
+        for rec in records:
+            for out_line, tok_count in zip(rec["outputs"], rec["token_counts"]):
+                outf.write(out_line + "\n")
+                tokf.write(f"{tok_count}\n")
+
+    Path(async_path).unlink()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Simple parallel materialize processor")
     parser.add_argument("--input_file", required=True, help="Input JSONL file")
@@ -432,10 +463,20 @@ def main():
         total_lines = sum(1 for _ in f)
     print(f"Total lines: {total_lines:,}")
 
+    tokens_output_path = args.tokens_file if args.tokens_file else f"{args.output_file}.tokens.jsonl"
+    async_path = args.output_file + "-async"
+
+    completed_positions = read_completed_positions(async_path)
+    if completed_positions:
+        print(f"Resuming: {len(completed_positions):,} lines already completed")
+    remaining_lines = total_lines - len(completed_positions)
+
     def task_iter():
         with open(args.input_file) as f:
             for i, line in enumerate(f):
-                yield (i + 1, line, args.extra_info)
+                if i in completed_positions:
+                    continue
+                yield (i, line, args.extra_info)
 
     def batched_task_iter():
         batch = []
@@ -452,39 +493,49 @@ def main():
     passed_count = 0
     failed_count = 0
 
-    tokens_output_path = args.tokens_file if args.tokens_file else f"{args.output_file}.tokens.jsonl"
-    with open(args.output_file, "w") as outfile, open(tokens_output_path, "w") as tokenfile:
+    with open(async_path, "at", encoding="utf-8", buffering=1) as async_file:
         with Pool(processes=args.workers) as pool:
             map_fn = pool.imap if args.ordered else pool.imap_unordered
             for batch_results in tqdm(
                 map_fn(process_batch, batched_task_iter(), chunksize=1),
-                total=(total_lines + args.batch_size - 1) // args.batch_size,
+                total=(remaining_lines + args.batch_size - 1) // args.batch_size,
                 desc="Processing",
                 unit="batch",
             ):
                 for result, line_num, error in batch_results:
                     if result is not None:
                         output_lines, token_counts = result
-                        for output_line, token_count in zip(output_lines, token_counts):
-                            outfile.write(output_line + "\n")
-                            tokenfile.write(f"{token_count}\n")
+                        record = json.dumps(
+                            {
+                                "outputs": output_lines,
+                                "token_counts": token_counts,
+                                "_async_position": line_num,
+                            }
+                        )
+                        async_file.write(record + "\n")
                         passed_count += 1
                     else:
                         failed_count += 1
                         if error and failed_count <= 10:
                             tqdm.write(f"Line {line_num}: {error}")
 
+    restore_async_order(async_path, args.output_file, tokens_output_path)
+
     # Final summary
     total_time = time.time() - start_time
-    final_rate = total_lines / total_time if total_time > 0 else 0
-    success_rate = passed_count / total_lines * 100 if total_lines > 0 else 0
+    previously_completed = len(completed_positions)
+    total_passed = previously_completed + passed_count
+    success_rate = total_passed / total_lines * 100 if total_lines > 0 else 0
+    process_rate = remaining_lines / total_time if total_time > 0 else 0
 
     print("\nProcessing complete!")
     print(f"Total time: {total_time:.1f}s")
-    print(f"Processed: {total_lines:,} lines")
-    print(f"Passed: {passed_count:,} ({success_rate:.1f}%)")
-    print(f"Failed: {failed_count:,}")
-    print(f"Average rate: {final_rate:.1f} lines/sec")
+    print(f"Total input lines: {total_lines:,}")
+    if previously_completed:
+        print(f"Resumed from checkpoint: {previously_completed:,} previously completed")
+    print(f"Processed this run: {passed_count:,} passed, {failed_count:,} failed")
+    print(f"Total passed: {total_passed:,} ({success_rate:.1f}%)")
+    print(f"Processing rate: {process_rate:.1f} lines/sec")
 
 
 if __name__ == "__main__":

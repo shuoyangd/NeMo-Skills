@@ -109,6 +109,7 @@ def convert_to_sft(cluster, expname, run_after, stage_config, code_dir, config=N
     output_dir = stage_config["output_dir"]
     model = stage_config["model"]
     num_shards = stage_config.get("num_shards", 1)
+    dependent_jobs = stage_config.get("dependent_jobs", 0)
     rerun_done = stage_config.get("rerun_done", False)
 
     jobs = stage_config.get("jobs", None)
@@ -133,11 +134,19 @@ def convert_to_sft(cluster, expname, run_after, stage_config, code_dir, config=N
     if num_shards <= 1:
         # No sharding — one job per file (still parallelizes across files vs old for-loop)
         for base, input_file in input_files:
+            output_file = f"{output_dir}/{base}_sft.jsonl"
+            done_guard = (
+                ""
+                if rerun_done
+                else f'if [ -f {output_file}.done ]; then echo "Already done, skipping"; exit 0; fi && '
+            )
             cmd = (
                 f"mkdir -p {output_dir} && "
+                f"{done_guard}"
                 f"{materialize_cmd}"
                 f" --input_file {input_file}"
-                f" --output_file {output_dir}/{base}_sft.jsonl"
+                f" --output_file {output_file}"
+                f" && touch {output_file}.done"
             )
             run_cmd(
                 ctx=wrap_arguments(cmd),
@@ -146,6 +155,7 @@ def convert_to_sft(cluster, expname, run_after, stage_config, code_dir, config=N
                 expname=f"{expname}-{base}",
                 run_after=run_after,
                 num_gpus=0,
+                dependent_jobs=dependent_jobs,
                 **stage_config.get("stage_kwargs", {}),
             )
     else:
@@ -197,6 +207,7 @@ def convert_to_sft(cluster, expname, run_after, stage_config, code_dir, config=N
                     expname=shard_exp,
                     run_after=run_after,
                     num_gpus=0,
+                    dependent_jobs=dependent_jobs,
                     **stage_config.get("stage_kwargs", {}),
                 )
 
