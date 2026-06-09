@@ -382,16 +382,26 @@ def read_completed_positions(async_path):
 
 def restore_async_order(async_path, output_file, tokens_file):
     """Sort async checkpoint by position, expand into final output + tokens files."""
+    positions = []
     with open(async_path, "rt", encoding="utf-8") as fin:
-        records = [json.loads(line) for line in fin if line.strip()]
+        while True:
+            offset = fin.tell()
+            line = fin.readline()
+            if not line:
+                break
+            if not line.strip():
+                continue
+            positions.append((json.loads(line)["_async_position"], offset))
 
-    records.sort(key=lambda r: r["_async_position"])
-
+    positions.sort()
     with open(output_file, "w") as outf, open(tokens_file, "w") as tokf:
-        for rec in records:
-            for out_line, tok_count in zip(rec["outputs"], rec["token_counts"]):
-                outf.write(out_line + "\n")
-                tokf.write(f"{tok_count}\n")
+        with open(async_path, "rt", encoding="utf-8") as fin:
+            for _, offset in positions:
+                fin.seek(offset)
+                rec = json.loads(fin.readline())
+                for out_line, tok_count in zip(rec["outputs"], rec["token_counts"]):
+                    outf.write(out_line + "\n")
+                    tokf.write(f"{tok_count}\n")
 
     Path(async_path).unlink()
 
