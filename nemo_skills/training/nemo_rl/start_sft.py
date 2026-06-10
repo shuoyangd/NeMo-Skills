@@ -15,14 +15,12 @@
 # copied from https://github.com/NVIDIA/NeMo-RL/blob/main/examples/run_sft.py
 
 import argparse
-import json
 import os
 import pprint
 from functools import partial
-from pathlib import Path
 from typing import Any, Dict, Optional
 
-from datasets import Dataset, load_dataset, load_from_disk
+from datasets import Dataset
 from nemo_rl.algorithms.sft import MasterConfig, setup, sft_train
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data import DataConfig
@@ -36,47 +34,11 @@ from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from nemo_skills.training.nemo_rl.sft_data import detect_data_format, load_or_process_prompt_response_split
 from nemo_skills.utils import setup_make_sequence_length_divisible_by
 
 TokenizerType = PreTrainedTokenizerBase
 _call_counter = 0
-
-
-def detect_data_format(data_path: str) -> str:
-    """Detect the format of the dataset by examining the first line.
-
-    Args:
-        data_path: Path to the dataset file
-
-    Returns:
-        str: "input_output" if data has input/output keys, "messages" if it has messages key,
-             "mixed" if it has both (error case)
-    """
-    try:
-        with open(data_path, "r") as f:
-            first_line = f.readline().strip()
-            if not first_line:
-                raise ValueError(f"Dataset at {data_path} is empty")
-
-            sample = json.loads(first_line)
-            has_input_output = "input" in sample and "output" in sample
-            has_messages = "messages" in sample
-
-            if has_input_output and has_messages:
-                return "mixed"
-            elif has_input_output:
-                return "input_output"
-            elif has_messages:
-                return "messages"
-            else:
-                raise ValueError(
-                    f"Dataset at {data_path} has neither 'input'/'output' keys nor 'messages' key. "
-                    f"Available keys: {list(sample.keys())}"
-                )
-    except FileNotFoundError:
-        raise ValueError(f"Dataset file not found: {data_path}")
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON in dataset file {data_path}: {e}")
 
 
 class PromptResponseDataset:
@@ -88,6 +50,9 @@ class PromptResponseDataset:
         output_key: str = "output",
         num_proc: int | None = None,
         force_reprocess: bool = False,
+        train_cache_path: str | None = None,
+        val_cache_path: str | None = None,
+        max_shard_size: str | int | None = None,
     ):
         self.input_key = input_key
         self.output_key = output_key
@@ -102,60 +67,33 @@ class PromptResponseDataset:
 
         # Train split
         self.formatted_ds = {
-            "train": self.load_or_process_split(train_ds_path, "train"),
+            "train": self.load_or_process_split(train_ds_path, "train", train_cache_path, max_shard_size),
         }
         # Validation split (optional)
         if val_ds_path:
-            self.formatted_ds["validation"] = self.load_or_process_split(val_ds_path, "val")
+            self.formatted_ds["validation"] = self.load_or_process_split(val_ds_path, "val", val_cache_path, max_shard_size)
         else:
             self.formatted_ds["validation"] = None
 
         self.task_spec = TaskDataSpec("json_dataset")
 
-    def load_or_process_split(self, path: str, split_name: str) -> Dataset:
-        data_path = Path(path)
-        cache_dir = data_path.parent / ".cache" / f"{split_name}_{data_path.stem}"
-        sig_file = cache_dir / "signature.json"
-        file_size = str(data_path.stat().st_size)
-        if cache_dir.exists() and sig_file.exists() and not self.force_reprocess:
-            with open(sig_file) as f:
-                old_sig = json.load(f)["size"]
-            if old_sig == file_size:
-                print(f"[Cache] Loading {split_name} dataset from: {cache_dir}")
-                return load_from_disk(str(cache_dir))
-            else:
-                print(f"[Cache] Invalidated (file size changed): {path}")
-
-        # Re-process dataset
-        print(f"[Map] Processing {split_name} dataset from: {path}")
-        dataset = load_dataset("json", data_files=str(path))["train"]
-
-        if "messages" not in dataset.column_names:
-            dataset = dataset.map(
-                self.add_messages_key,
-                batched=True,
-                num_proc=self.num_proc,
-            )
-
-        # Save dataset + new size signature
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        dataset.save_to_disk(str(cache_dir))
-        with open(sig_file, "w") as f:
-            json.dump({"size": file_size}, f)
-
-        print(f"[Cache] Saved {split_name} dataset to: {cache_dir}")
-        return dataset
-
-    def add_messages_key(self, examples: dict[str, list[Any]]) -> dict[str, list[list[dict[str, Any]]]]:
-        return {
-            "messages": [
-                [
-                    {"role": "user", "content": input_},
-                    {"role": "assistant", "content": output},
-                ]
-                for input_, output in zip(examples[self.input_key], examples[self.output_key])
-            ]
-        }
+    def load_or_process_split(
+        self,
+        path: str,
+        split_name: str,
+        cache_path: str | None = None,
+        max_shard_size: str | int | None = None,
+    ) -> Dataset:
+        return load_or_process_prompt_response_split(
+            path,
+            split_name,
+            input_key=self.input_key,
+            output_key=self.output_key,
+            num_proc=self.num_proc,
+            force_reprocess=self.force_reprocess,
+            cache_dir=cache_path,
+            max_shard_size=max_shard_size,
+        )
 
 
 def parse_args():
@@ -234,7 +172,11 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         data_config.get("val_data_path"),
         data_config["input_key"],
         data_config["output_key"],
+        num_proc=data_config.get("preprocessing_num_proc"),
         force_reprocess=data_config.get("force_reprocess", False),
+        train_cache_path=data_config.get("train_cache_path"),
+        val_cache_path=data_config.get("val_cache_path"),
+        max_shard_size=data_config.get("preprocessing_max_shard_size"),
     )
     print(f"  ✓ Training dataset loaded with {len(data.formatted_ds['train'])} samples.")
     if data.formatted_ds["validation"] is not None:
