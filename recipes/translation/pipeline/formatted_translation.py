@@ -38,10 +38,13 @@ Required top-level config keys:
   fields_to_translate:  list of top-level fields that must be translated
   fields_to_consider:   (optional) fields shown to the model; defaults to fields_to_translate
   input_file:           path to the original JSONL
-  target_lang:          target language name (e.g. "German")
+  target_lang:          one target language name (e.g. "German"), or
+  target_langs:         weighted list of {language, weight} objects
 """
 
 import argparse
+import json
+import shlex
 from pathlib import Path
 
 from omegaconf import OmegaConf
@@ -121,15 +124,31 @@ def wrap(cluster, expname, run_after, stage_config, **kwargs):
     base_output_dir = kwargs["base_output_dir"]
 
     input_file = stage_config.get("input_file", f"{base_output_dir}/make_concise/concise.jsonl")
-    target_lang = stage_config.get("target_lang", kwargs.get("target_lang"))
+    if "target_lang" in stage_config:
+        target_lang = stage_config["target_lang"]
+        target_langs = None
+    elif "target_langs" in stage_config:
+        target_lang = None
+        target_langs = stage_config["target_langs"]
+    else:
+        target_lang = kwargs.get("target_lang")
+        target_langs = kwargs.get("target_langs")
+    if (target_lang is None) == (target_langs is None):
+        raise ValueError("wrap requires exactly one of target_lang or target_langs")
+    seed = int(stage_config.get("language_seed", kwargs.get("language_seed", 0)))
     output_dir = _stage_dir(base_output_dir, "wrap", stage_config)
     output_file = stage_config.get("output_file", f"{output_dir}/wrapped.jsonl")
 
+    language_args = (
+        f"--target-lang {shlex.quote(str(target_lang))}"
+        if target_lang is not None
+        else f"--target-langs-json {shlex.quote(json.dumps(target_langs))} --seed {seed}"
+    )
     cmd = (
         f"python {_SCRIPTS_DIR}/wrap_sft_data.py "
         f"    --input {input_file} "
         f"    --output {output_file} "
-        f"    --target-lang '{target_lang}' "
+        f"    {language_args} "
     )
     run_cmd(
         ctx=wrap_arguments(cmd),
@@ -615,6 +634,10 @@ if __name__ == "__main__":
     from_messages = config.get("from_messages", False)
     input_file = config.get("input_file")
     target_lang = config.get("target_lang")
+    target_langs = config.get("target_langs")
+    language_seed = config.get("language_seed", 0)
+    if (target_lang is None) == (target_langs is None):
+        raise ValueError(f"{config_path} must define exactly one of 'target_lang' or 'target_langs'.")
 
     prev_expname = None
     for stage in stages_to_run:
@@ -650,6 +673,8 @@ if __name__ == "__main__":
             from_messages=from_messages,
             input_file=input_file,
             target_lang=target_lang,
+            target_langs=target_langs,
+            language_seed=language_seed,
             pipeline_stages=full_stage_sequence,
         )
         prev_expname = current_expname

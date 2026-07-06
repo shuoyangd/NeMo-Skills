@@ -15,7 +15,20 @@ fields_to_consider:
   - generation
 
 input_file: /path/to/input.jsonl
-target_lang: German
+
+# Choose either one target language:
+# target_lang: German
+# Or weighted targets (weights are normalized and need not sum exactly to 1):
+target_langs:
+  - language: German
+    weight: 0.4
+  - language: French
+    weight: 0.3
+  - language: Russian
+    weight: 0.2
+  - language: Japanese
+    weight: 0.1
+language_seed: 0
 
 # Set this when translating message-style data and mapping fields by message position.
 # from_messages: true
@@ -39,6 +52,7 @@ stages:
 
   wrap:
     # target_lang: German  # uncomment to override top-level target_lang
+    # language_seed: 123   # override the reproducible assignment seed
     # output_file: ...     # defaults to {base_output_dir}/wrap/wrapped.jsonl
 
   escape_special_tokens:

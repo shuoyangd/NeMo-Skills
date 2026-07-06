@@ -90,7 +90,9 @@ Important fields:
 - `expname`: base experiment name; each stage appends its own suffix.
 - `suffix`: optional suffix used in experiment names. Defaults to the config name.
 - `input_file`: original JSONL file.
-- `target_lang`: target language name used by the prompt wrapper.
+- `target_lang`: a single target language name used by the prompt wrapper. Mutually exclusive with `target_langs`.
+- `target_langs`: weighted list of `{language, weight}` objects. Weights must be positive and are normalized automatically. The wrapper uses largest-remainder allocation, so record counts match the requested proportions as closely as integer counts allow.
+- `language_seed`: optional seed (default `0`) used to reproducibly shuffle weighted language assignments.
 - `fields_to_translate`: fields that should be replaced in the final merged output.
 - `fields_to_consider`: fields shown to the model. Defaults to `fields_to_translate`.
 - `from_messages`: when true, fields are extracted from `messages[i].content` by position and merged back into the `messages` array.
@@ -107,7 +109,7 @@ Per-stage configs commonly support:
 
 ### `make_concise`
 
-Keeps only `fields_to_consider` from each input record and adds `_translation_src_id`, a stable hash of the original record. The ID lets downstream stages merge generation records back into the original file without relying only on line alignment.
+Keeps only `fields_to_consider` from each input record and adds `_translation_src_id`, a stable hash of the original record. The ID lets downstream stages merge generation records back into the original file without relying only on line alignment. When the original record contains `metadata.dataset_id`, it is also propagated as `_translation_dataset_id`. Both `_translation_*` fields remain outside the model-visible `src` payload.
 
 Default input:
 
@@ -130,6 +132,8 @@ Wraps each concise record as translation prompt input:
 ```json
 {"source_lang": "English", "target_lang": "Simplified Chinese", "src": "{...}"}
 ```
+
+With `target_langs`, every record still has exactly one `target_lang`, and the weighted split is applied independently to every unique `_translation_dataset_id`. For example, each dataset containing 100 rows and weights `0.4/0.3/0.2/0.1` produces 40 German, 30 French, 20 Russian, and 10 Japanese prompts in a seed-controlled shuffled order. Records without a dataset ID are treated as one additional group. For group sizes that do not divide cleanly, largest-remainder allocation gives the closest integer counts. The legacy single-language `target_lang` config remains supported.
 
 Default output:
 

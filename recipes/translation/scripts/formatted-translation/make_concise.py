@@ -15,7 +15,11 @@
 
 """
 Produce a concise version of an input JSONL by keeping only the specified fields,
-and stamp each output record with a _translation_src_id derived from the original.
+stamp each output record with a _translation_src_id derived from the original,
+and metadata.dataset as _translation_dataset_id when present.
+
+Fields prefixed with _translation_ are pipeline metadata. Downstream stages
+carry them outside the model-visible source payload.
 
 The ID is a SHA-256 hash (first 16 hex chars) of the canonically serialized
 original record (sorted keys, no extra whitespace).  Two records with identical
@@ -91,6 +95,11 @@ def make_concise_file(
 
             if add_src_id:
                 concise["_translation_src_id"] = compute_src_id(record)
+
+            metadata = record.get("metadata")
+            if isinstance(metadata, dict) and "dataset" in metadata:
+                concise["_translation_dataset_id"] = metadata["dataset"]
+
             fout.write(json.dumps(concise, ensure_ascii=False) + "\n")
 
     if skipped:
